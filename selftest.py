@@ -32,7 +32,7 @@ def main() -> int:
 
     checks.append(("MCP manager started", True, st["transport"]))
     checks.append(
-        ("Tools discovered (>=12)", st["tool_count"] >= 12, f"{st['tool_count']} tools")
+        ("Tools discovered (>=14)", st["tool_count"] >= 14, f"{st['tool_count']} tools")
     )
     # We expect real MCP in a normal environment, but the fallback is also valid.
     checks.append(
@@ -41,10 +41,8 @@ def main() -> int:
 
     agent = Agent(mgr, MockLLM())
 
-    # Read-only commands only — no data mutation.
+    # Read-only, local (no-auth) commands only — no data mutation, no Google.
     cases = {
-        "Do I have any unread emails?": "email_list",
-        "What's on my calendar?": "calendar_list_events",
         "Show me my tasks": "tasks_list",
         "List my notes": "notes_list",
         "Search my notes about gifts": "notes_search",

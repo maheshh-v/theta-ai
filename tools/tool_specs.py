@@ -1,84 +1,124 @@
 """
-Declarative specs for every tool, used as the in-process fallback if the MCP
-stdio transport is unavailable (e.g. a locked-down host). In the normal path
-the agent discovers tools live over MCP; this list is the safety net so the
-demo always runs.
+Declarative specs for every tool — the in-process fallback used when the MCP
+stdio transport is unavailable (locked-down host, sandbox). In the normal path
+the agent discovers tools live over MCP; this list is the safety net so the app
+still works, and doubles as a single readable catalogue of what Theta can do.
 
-Keeping the fallback here also gives a single, readable catalogue of what the
-assistant can do — handy when documenting "how to add a tool".
+`access_token` on the Gmail/Calendar tools is a reserved parameter injected by
+the manager at call time — it is hidden from the LLM (see tools/catalog.py).
 """
 
 from __future__ import annotations
 
-from tools import backends
+from tools import backends, google_tools
 
 # Each spec mirrors the corresponding @mcp.tool() in tools/servers/*.py.
-# `parameters` uses JSON-Schema-style entries so the fallback presents tools to
-# the LLM in exactly the same shape as MCP's discovered inputSchema.
 TOOL_SPECS: list[dict] = [
-    # --- email ---
+    # --- gmail (real, needs Google auth) ---
     {
-        "name": "email_list",
-        "server": "email",
-        "fn": backends.email_list,
-        "description": "List inbox emails. Set unread_only=true for only unread messages.",
-        "parameters": {"unread_only": {"type": "boolean", "default": False}},
-    },
-    {
-        "name": "email_read",
-        "server": "email",
-        "fn": backends.email_read,
-        "description": "Read the full contents of a single email by its id (e.g. 'e1').",
-        "parameters": {"email_id": {"type": "string", "required": True}},
-    },
-    {
-        "name": "email_search",
-        "server": "email",
-        "fn": backends.email_search,
-        "description": "Search emails by sender, subject, or body text.",
-        "parameters": {"query": {"type": "string", "required": True}},
-    },
-    {
-        "name": "email_draft_reply",
-        "server": "email",
-        "fn": backends.email_draft_reply,
-        "description": "Draft a reply to an email (saved locally, NOT sent).",
+        "name": "gmail_list",
+        "server": "gmail",
+        "fn": google_tools.gmail_list,
+        "description": "List recent inbox emails. Set unread_only=true for only unread.",
         "parameters": {
-            "email_id": {"type": "string", "required": True},
-            "message": {"type": "string", "required": True},
+            "access_token": {"type": "string", "required": True},
+            "unread_only": {"type": "boolean", "default": False},
         },
     },
-    # --- calendar + tasks ---
     {
-        "name": "calendar_list_events",
-        "server": "calendar",
-        "fn": backends.calendar_list_events,
-        "description": "List calendar events. Optionally filter to one date (YYYY-MM-DD).",
-        "parameters": {"date": {"type": "string", "default": ""}},
+        "name": "gmail_search",
+        "server": "gmail",
+        "fn": google_tools.gmail_search,
+        "description": "Search email with Gmail query syntax (from:, subject:, keywords).",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "query": {"type": "string", "required": True},
+        },
     },
     {
-        "name": "calendar_add_event",
-        "server": "calendar",
-        "fn": backends.calendar_add_event,
-        "description": "Add a calendar event. date=YYYY-MM-DD, time=HH:MM (24h).",
+        "name": "gmail_read",
+        "server": "gmail",
+        "fn": google_tools.gmail_read,
+        "description": "Read one email in full (headers + plain-text body) by its id.",
         "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "message_id": {"type": "string", "required": True},
+        },
+    },
+    {
+        "name": "gmail_draft_reply",
+        "server": "gmail",
+        "fn": google_tools.gmail_draft_reply,
+        "description": "Draft a reply to an email id (saved to Drafts, NOT sent).",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "message_id": {"type": "string", "required": True},
+            "body": {"type": "string", "required": True},
+        },
+    },
+    {
+        "name": "gmail_send_reply",
+        "server": "gmail",
+        "fn": google_tools.gmail_send_reply,
+        "description": "Send a reply to an email id. Requires explicit user approval.",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "message_id": {"type": "string", "required": True},
+            "body": {"type": "string", "required": True},
+        },
+    },
+    # --- calendar (real, needs Google auth) ---
+    {
+        "name": "calendar_list",
+        "server": "calendar",
+        "fn": google_tools.calendar_list,
+        "description": "List upcoming events, or all events on one YYYY-MM-DD date.",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "date": {"type": "string", "default": ""},
+        },
+    },
+    {
+        "name": "calendar_add",
+        "server": "calendar",
+        "fn": google_tools.calendar_add,
+        "description": "Add a calendar event. date=YYYY-MM-DD, time=HH:MM (24h). Approval-gated.",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
             "title": {"type": "string", "required": True},
             "date": {"type": "string", "required": True},
             "time": {"type": "string", "default": ""},
+            "duration_min": {"type": "integer", "default": 60},
             "location": {"type": "string", "default": ""},
-            "notes": {"type": "string", "default": ""},
+            "description": {"type": "string", "default": ""},
         },
     },
     {
-        "name": "tasks_list",
+        "name": "calendar_update",
         "server": "calendar",
+        "fn": google_tools.calendar_update,
+        "description": "Update an existing event by id (only provided fields change). Approval-gated.",
+        "parameters": {
+            "access_token": {"type": "string", "required": True},
+            "event_id": {"type": "string", "required": True},
+            "title": {"type": "string", "default": ""},
+            "date": {"type": "string", "default": ""},
+            "time": {"type": "string", "default": ""},
+            "location": {"type": "string", "default": ""},
+            "description": {"type": "string", "default": ""},
+        },
+    },
+    # --- tasks (local) ---
+    {
+        "name": "tasks_list",
+        "server": "tasks",
         "fn": backends.tasks_list,
         "description": "List to-do tasks. Set include_done=true to also show completed tasks.",
         "parameters": {"include_done": {"type": "boolean", "default": False}},
     },
     {
         "name": "tasks_add",
-        "server": "calendar",
+        "server": "tasks",
         "fn": backends.tasks_add,
         "description": "Add a to-do task. due=YYYY-MM-DD; priority is low/medium/high.",
         "parameters": {
@@ -89,12 +129,12 @@ TOOL_SPECS: list[dict] = [
     },
     {
         "name": "tasks_complete",
-        "server": "calendar",
+        "server": "tasks",
         "fn": backends.tasks_complete,
         "description": "Mark a to-do task as done by its id (e.g. 't1').",
         "parameters": {"task_id": {"type": "string", "required": True}},
     },
-    # --- notes ---
+    # --- notes (local) ---
     {
         "name": "notes_list",
         "server": "notes",
@@ -124,8 +164,8 @@ TOOL_SPECS: list[dict] = [
 
 
 def spec_to_input_schema(spec: dict) -> dict:
-    """Convert a fallback spec's `parameters` into a JSON-Schema object,
-    matching the shape MCP returns from list_tools()."""
+    """Convert a fallback spec's `parameters` into a JSON-Schema object, matching
+    the shape MCP returns from list_tools()."""
     props = {}
     required = []
     for pname, pinfo in spec["parameters"].items():

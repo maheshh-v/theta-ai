@@ -1,0 +1,18 @@
+{
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Call the dentist",
+      "due": "2026-08-15",
+      "done": false,
+      "priority": "high"
+    },
+    {
+      "id": "t2",
+      "title": "Meet at 4 pm today",
+      "due": "",
+      "done": false,
+      "priority": "medium"
+    }
+  ]
+}

@@ -2,242 +2,205 @@
 title: Theta AI
 emoji: 🤖
 colorFrom: indigo
-colorTo: blue
-sdk: gradio
-sdk_version: 6.22.0
-app_file: app.py
+colorTo: purple
+sdk: docker
+app_port: 7860
 pinned: false
 license: mit
 ---
 
-# 🤖 Theta AI — Personal AI Assistant
+# θ Theta — a personal AI agent
 
-A personal AI agent that takes **natural-language commands** and performs real
-tasks by calling tools through the **Model Context Protocol (MCP)**. Ask it to
-check your inbox, draft a reply, look at your calendar, add a task, or search
-your notes — and watch it **show its reasoning**: which tool it picked, why, the
-arguments it passed, and the raw result.
+Theta takes **natural-language commands** and actually does things across your
+**real Gmail and Google Calendar** — reading and searching mail, drafting and
+(with your approval) sending replies, checking your schedule and adding events —
+plus keeping local **notes and tasks** as its own memory. It decides which tool
+to use, calls it over the **Model Context Protocol (MCP)**, and shows you a
+concise, live trace of every step.
 
-Everything runs on **local mock data** (no Gmail/Google accounts, no OAuth), and
-the default LLM is **Google Gemini's free tier** — with a one-line switch to a
-local **Ollama** model, or a built-in **mock mode** that needs no key at all.
+It is not a chatbot. A chatbot writes text; Theta takes actions on your accounts —
+and asks first before it sends mail or changes your calendar.
 
-> Type *"Do I have any unread emails?"* → the agent decides to call the
-> `email_list` tool with `{"unread_only": true}`, runs it over a live MCP
-> session, and summarises the result. The reasoning panel shows every step.
+> Type *"Do I have any unread emails?"* → Theta calls the `gmail_list` tool over a
+> live MCP session, streams `Reading Gmail → Found 3 emails`, and answers.
+> Ask it to *"reply to Priya and send it"* → it drafts the reply and **pauses for
+> your approval** before anything leaves your outbox.
 
 ---
 
-## ✨ What it does
+## ✨ Highlights
 
-- **Chat UI (Gradio):** one box, type commands in plain English.
-- **Real MCP tools:** three MCP servers (email, calendar/tasks, notes), each
-  exposing its own set of tools over a stdio connection. Tools are **discovered
-  at runtime** — the agent isn't hard-coded to what they can do.
-- **Transparent agent loop:** a small controller lets the LLM decide which tool
-  to call, calls it, feeds the result back, and repeats until it has an answer.
-  Every step is displayed, not hidden.
-- **Three tools, zero auth:**
-  - 📧 **Email** — list/read/search a sample inbox, and *draft* replies (never sent).
-  - 📅 **Calendar & Tasks** — view/add events, view/add/complete to-dos.
-  - 📝 **Notes** — save and search notes.
-- **Graceful everywhere:** if the LLM or a tool fails, the assistant explains what
-  went wrong instead of crashing. If MCP subprocesses can't start (locked-down
-  host), it transparently falls back to running the same tools in-process.
+- **Real integrations, not mock data.** Gmail + Google Calendar over OAuth 2.0.
+  Connect your account from the UI; disconnect any time.
+- **Human-in-the-loop safety.** Sending email and any calendar change are
+  **approval-gated** — Theta shows exactly what it will do and waits for a click.
+- **Bring your own model.** A Settings page to choose the LLM provider
+  (Google Gemini / local Ollama / a keyless mock) and set your own API key —
+  masked in the UI, encrypted at rest, never logged.
+- **Transparent execution.** A streamed timeline shows each tool, a one-line
+  result, and its status — with raw details tucked behind a "developer details"
+  disclosure. No raw chain-of-thought is exposed.
+- **Real MCP architecture.** Four MCP tool servers run as separate subprocesses;
+  tools are discovered at runtime, so adding one needs no changes to the agent.
+- **Secure by construction.** Per-session encrypted token storage, CSRF-protected
+  OAuth, log scrubbing, and least-privilege scopes.
 
 ## 🧠 Architecture
 
-The system is four layers, each independent and swappable.
+Four independent, swappable layers — the same clean separation the project was
+built on, now with a real web/OAuth layer and real integrations.
 
 ```
-  You (natural language)
+  Browser SPA (vanilla JS, streamed trace + approval cards)
+        │  REST + NDJSON stream          ▲ approve / reject
+        ▼                                │
+  FastAPI app  ──  encrypted per-session store (cookie → server-side tokens/keys)
+   ├─ /api/chat (stream)   → Agent loop (resumable, approval-gated)
+   ├─ /api/chat/resume     → resume a paused run
+   ├─ /api/auth/google/*   → OAuth login / callback / disconnect
+   ├─ /api/accounts        → connected-account status
+   └─ /api/settings[/test] → LLM provider / key (masked, encrypted)
         │
         ▼
-  ┌───────────────┐     JSON action      ┌──────────────────────────┐
-  │  Gradio UI    │ ───────────────────▶ │  Agent loop (orchestrator)│
-  │  ui/app.py    │ ◀─────────────────── │  agent/orchestrator.py    │
-  └───────────────┘   answer + trace     └────────────┬─────────────┘
-                                                       │ decide (LLM)
-                                        ┌──────────────▼─────────────┐
-                                        │  LLM: Gemini / Ollama / Mock│
-                                        │  agent/llm.py               │
-                                        └──────────────┬─────────────┘
-                                                       │ call_tool over MCP
-                                        ┌──────────────▼─────────────┐
-                                        │  MCP client manager         │
-                                        │  tools/mcp_client.py        │
-                                        └──────┬───────────┬──────────┘
-                                     stdio     │           │    stdio
-                              ┌───────────────▼─┐   ┌─────▼───────────────┐
-                              │ MCP servers      │   │ ... email, calendar │
-                              │ tools/servers/*  │   │     notes           │
-                              └────────┬─────────┘   └─────────┬───────────┘
-                                       └──── local JSON ───────┘
-                                             data/*.json
+   Agent loop (agent/orchestrator.py) ── ReAct JSON controller, step cap
+        │  call_tool(name, args, ctx)     (injects the session's Google token)
+        ▼
+   MCP client manager (tools/mcp_client.py) ── stdio sessions, sync API, fallback
+        ├─ notes    (local JSON)
+        ├─ tasks    (local JSON)
+        ├─ gmail    (real Google API, token injected per call)
+        └─ calendar (real Google API, token injected per call)
 ```
 
-**1. UI (`ui/app.py`)** — a Gradio chat interface. It doesn't know anything
-about tools or LLMs; it just sends the typed command to the agent and renders
-whatever comes back, including a collapsible reasoning panel.
+- **UI** (`server/static/`) — a self-contained SPA (Chat / Accounts / Settings /
+  Activity). It knows nothing about tools or LLMs; it streams events and renders
+  them.
+- **Agent loop** (`agent/orchestrator.py`) — asks the LLM for one JSON action at a
+  time, runs it, and repeats. It is **resumable**: when the model picks an
+  approval-gated tool it pauses and hands control back to you.
+- **LLM layer** (`agent/llm.py`) — one `complete()` interface over Gemini / Ollama
+  / Mock, all via plain REST. Per-session config overrides the environment.
+- **Tools** (`tools/`, `integrations/google/`) — Gmail/Calendar are stateless MCP
+  servers; the manager injects the caller's access token at call time (the LLM
+  never sees it) and scrubs it from the trace. Notes/Tasks are local JSON.
 
-**2. Agent loop (`agent/orchestrator.py`)** — the core control flow. On each
-turn it builds a prompt listing the available tools, asks the LLM to decide
-what to do next, and gets back one JSON object:
-
-```json
-{ "thought": "why I'm doing this", "action": "email_list", "action_input": {"unread_only": true} }
-```
-
-If `action` names a tool, the orchestrator calls it, appends the result to the
-running transcript, and loops. If `action` is `"FINAL"`, it returns the answer
-to the UI. A step cap (`MAX_AGENT_STEPS`) prevents runaway loops. Every step —
-thought, tool, arguments, result, and whether it came from a live MCP call or
-the fallback — is recorded and shown in the UI's reasoning panel.
-
-**3. LLM layer (`agent/llm.py`)** — one interface, three interchangeable
-providers: Gemini (REST calls to Google AI Studio), Ollama (REST calls to a
-local server), or a keyless mock that uses simple keyword rules to pick a tool
-so the whole loop still runs with zero setup. Provider choice is entirely
-config-driven (`config.py` / `.env`); the orchestrator never knows which one is
-active.
-
-**4. Tools layer (`tools/`)** — the part that actually does things.
-`tools/backends.py` holds the plain-Python logic (read/write local JSON).
-`tools/servers/*.py` wraps that logic as MCP tools, one file per domain
-(email, calendar, notes), each running as its own subprocess and speaking MCP
-over stdio. `tools/mcp_client.py` is the client side: it spins up all three
-server subprocesses, keeps their sessions alive in a background event loop,
-discovers their tools automatically, and exposes a plain synchronous
-`call_tool(name, args)` to the rest of the app. If a server process can't be
-spawned (e.g. a locked-down host), the manager falls back to calling the same
-backend functions in-process — the agent doesn't need to know the difference.
-
-This separation means each layer can be swapped independently: point the LLM
-layer at a different provider, add a new MCP server without touching the
-agent, or replace the Gradio UI with something else, all without breaking the
-others.
-
-## 🗂️ Project structure
-
-```
-assistant/
-├── app.py                  # Entry point (local run + HuggingFace Spaces)
-├── config.py                # Env-driven settings (LLM choice, paths)
-├── agent/
-│   ├── llm.py                # Gemini / Ollama / Mock providers (one interface)
-│   └── orchestrator.py       # The agent loop + reasoning trace
-├── tools/
-│   ├── backends.py           # Core tool logic over local JSON
-│   ├── tool_specs.py         # Fallback tool catalogue (in-process safety net)
-│   ├── mcp_client.py         # MCP client manager (stdio sessions, sync API)
-│   └── servers/
-│       ├── email_server.py     # MCP server: email
-│       ├── calendar_server.py  # MCP server: calendar + tasks
-│       └── notes_server.py     # MCP server: notes
-├── ui/
-│   └── app.py               # Gradio Blocks UI + reasoning display
-├── data/
-│   ├── emails.json           # Mock inbox
-│   ├── calendar.json         # Mock events + tasks
-│   └── notes.json            # Mock notes
-├── requirements.txt
-└── .env.example
-```
-
-## 🚀 Quickstart
+## 🚀 Run it locally
 
 ```bash
-# 1. Create a virtual environment
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-# 2. Install dependencies
+# Windows:  .venv\Scripts\activate     macOS/Linux:  source .venv/bin/activate
 pip install -r requirements.txt
-
-# 3. (Optional) configure an LLM — skip to run in mock mode
-cp .env.example .env       # then paste a free GEMINI_API_KEY
-
-# 4. Run
+cp .env.example .env        # optional, but needed for real Gmail/Calendar
 python app.py
 ```
 
-Open http://127.0.0.1:7860 and start typing.
+Open **http://localhost:7860**. With no configuration Theta still runs: notes and
+tasks work, and you can drive the whole agent loop with the keyless mock model —
+Gmail/Calendar simply show a "Connect your Google account" state until you set up
+OAuth below.
 
-### Choosing an LLM
+## 🔑 Connect Gmail + Calendar (Google Cloud setup)
 
-| Provider | Setup | Cost |
-|----------|-------|------|
-| **Gemini** (default) | Get a free key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey), put it in `.env` as `GEMINI_API_KEY` | Free tier |
-| **Ollama** (local) | Install [Ollama](https://ollama.com), `ollama pull llama3.2`, set `LLM_PROVIDER=ollama` in `.env` | Free / offline |
-| **Mock** (no key) | Do nothing — used automatically when no key is present | Free |
+Real Google access requires an OAuth client that **you** create (Google doesn't
+let apps create it for you). One-time, ~5 minutes, in the
+[Google Cloud Console](https://console.cloud.google.com):
 
-Mock mode is clearly labelled in the UI ("⚠️ demo mode"). It uses keyword
-heuristics to pick a tool so the full loop and reasoning display still work.
+1. **Create a project** (or pick one).
+2. **Enable APIs** — *APIs & Services → Library* → enable **Gmail API** and
+   **Google Calendar API**.
+3. **OAuth consent screen** — choose **External**, fill the basics, and under
+   **Test users** add your own Google address. (In "Testing" status, you plus up
+   to 100 test users can use the app without Google verification.)
+4. **Credentials → Create credentials → OAuth client ID → Web application.**
+   Add this **Authorized redirect URI**:
+   ```
+   http://localhost:7860/api/auth/google/callback
+   ```
+   (For a deployed instance, also add `https://<your-domain>/api/auth/google/callback`.)
+5. Copy the **Client ID** and **Client secret** into `.env`:
+   ```
+   GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=xxxx
+   ```
+6. Restart Theta, open **Accounts**, and click **Connect Google**.
 
-### Try these commands
+Scopes requested (least-privilege): Gmail `readonly`, `compose`, `send`;
+Calendar `readonly`, `events`; plus `openid email profile` to show which account
+is connected.
 
-- `Do I have any unread emails?`
-- `Draft a reply to Priya telling her I'll send the slides tomorrow morning`
-- `What's on my calendar this week?`
-- `Add a task to call the dentist, due 2026-08-12, high priority`
-- `Save a note titled 'Demo ideas' with content 'Show the MCP reasoning panel'`
-- `Search my notes about gifts`
+## ⚙️ Configuration
 
-## ➕ Adding a new tool
+All optional except the Google client (for real mail/calendar). See
+[`.env.example`](.env.example) for the full list.
 
-It takes three small steps — the agent discovers the new tool automatically, no
-prompt edits needed:
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Enable Gmail + Calendar OAuth |
+| `PUBLIC_BASE_URL` | Public URL when deployed (builds the OAuth redirect) |
+| `GEMINI_API_KEY` | Default Gemini key (users can also set their own in Settings) |
+| `LLM_PROVIDER` | `gemini` / `ollama` / `mock` (auto-detected otherwise) |
+| `THETA_SECRET_KEY` | Stable key that encrypts stored tokens/keys at rest |
+| `THETA_HOST` / `THETA_PORT` | Bind address (default `127.0.0.1:7860`) |
+| `THETA_COOKIE_SECURE` | Set to `1` when serving over HTTPS |
 
-1. **Write the logic** in `tools/backends.py` as a plain Python function
-   (read/write local JSON in `data/`).
-2. **Expose it** with an `@mcp.tool()` wrapper in the right file under
-   `tools/servers/` (or add a new `*_server.py` and register it in
-   `tools/mcp_client.py::_server_specs`). The function's **docstring becomes the
-   description the LLM sees**, so write it for a reader.
-3. *(optional)* Mirror it in `tools/tool_specs.py` so the in-process fallback
-   knows about it too.
+## 🔒 Security model
 
-Example:
+- **Tokens & keys never reach the browser.** A random session id lives in an
+  encrypted, http-only cookie; the actual OAuth tokens and any user-set API key
+  stay server-side, **encrypted at rest** with Fernet (`cryptography`).
+- **Least privilege + explicit consent.** Only the scopes above; you approve on
+  Google's own screen, and can disconnect (revoking the token) any time.
+- **Approval gate.** `gmail_send_reply`, `calendar_add`, and `calendar_update`
+  never run without an explicit click. No hard-delete tools ship.
+- **No leaks.** Access tokens are injected server-side and scrubbed from the
+  trace; a logging filter redacts any known secret; keys are masked in the UI.
 
-```python
-# tools/backends.py
-def notes_delete(note_id: str) -> dict:
-    """Delete a note by id."""
-    ...
+## ➕ Add a new tool
 
-# tools/servers/notes_server.py
-@mcp.tool()
-def notes_delete(note_id: str) -> dict:
-    """Delete a saved note by its id (e.g. 'n2')."""
-    return backends.notes_delete(note_id)
+Still three small steps — the agent discovers it automatically, no prompt edits:
+
+1. Write the logic (a plain function in `tools/backends.py` for local data, or a
+   function in `integrations/…` for an external API).
+2. Wrap it with `@mcp.tool()` in the relevant `tools/servers/*_server.py` (or add
+   a new server and register it in `tools/mcp_client.py::_server_specs`). The
+   docstring becomes the description the LLM reads.
+3. *(optional)* Mirror it in `tools/tool_specs.py` for the in-process fallback,
+   and tag it in `tools/catalog.py` if it needs approval or Google auth.
+
+## ☁️ Deploy
+
+The included [`Dockerfile`](Dockerfile) serves the app on port 7860.
+
+```bash
+docker build -t theta .
+docker run -p 7860:7860 --env-file .env theta
 ```
 
-## ☁️ Deploy free on HuggingFace Spaces
+On **Hugging Face Spaces**, create a **Docker** Space and push this repo (the YAML
+header above configures it). Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`PUBLIC_BASE_URL` (your Space URL), and a `THETA_SECRET_KEY` in
+**Settings → Variables and secrets**, and add the Space's
+`/api/auth/google/callback` URL to your OAuth client.
 
-1. Create a new **Space** → SDK: **Gradio**.
-2. Upload this project (or push the repo). The YAML header at the top of this
-   `README.md` configures the Space (`sdk: gradio`, `app_file: app.py`).
-3. *(Optional)* In **Settings → Variables and secrets**, add `GEMINI_API_KEY`
-   for real AI answers. Without it, the Space runs in mock mode.
+## ✅ Tests
 
-That's it — `app.py` launches the Gradio app on the port the platform provides.
+```bash
+pip install -r requirements-dev.txt
+pytest          # unit + API tests (encryption, OAuth, tools, approval, settings)
+python selftest.py   # boots the real MCP stack and the agent loop
+```
 
-## 🛠️ Tech stack
+## ⚠️ Honest limitations
 
-- **Model Context Protocol (MCP)** — the tool servers and client session.
-- **Gradio** — the web UI.
-- **Google Gemini** (free tier) / **Ollama** / mock — the LLM, called over REST.
+- **Single instance = one shared secret.** Sessions isolate users' tokens, but a
+  public instance should run privately or per-user; there's no full account
+  system (Google is the only identity).
+- **No conversation memory across turns** — each command is independent.
+- **Email is reply-focused.** Theta drafts/sends *replies*; composing brand-new
+  threads and Google Tasks are natural next tools (the architecture makes them
+  easy to add).
+- **Free-tier LLM quotas** are tight; Theta degrades gracefully to clear errors.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE). The mock data in `data/` is fictional.
-
-## 🔒 A note on safety
-
-This is a demo on **local mock data**. Email replies are **drafted, never sent**.
-There is no real Gmail/Calendar integration and no OAuth — swapping in real
-integrations would mean replacing the functions in `tools/backends.py` with real
-API calls (and adding the appropriate auth), while the agent and UI stay the same.
+MIT — see [LICENSE](LICENSE).

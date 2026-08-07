@@ -53,15 +53,15 @@ class GeminiLLM(BaseLLM):
         "gemini-1.5-flash",
     ]
 
-    def __init__(self) -> None:
-        if not settings.gemini_api_key:
-            raise LLMError("GEMINI_API_KEY is not set.")
-        self.api_key = settings.gemini_api_key
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        key = api_key if api_key is not None else settings.gemini_api_key
+        if not key:
+            raise LLMError("No Gemini API key set. Add one in Settings or .env.")
+        self.api_key = key
+        model = model or settings.gemini_model
         # Configured model first, then fallbacks (de-duplicated).
-        self.models = [settings.gemini_model] + [
-            m for m in self.FALLBACK_MODELS if m != settings.gemini_model
-        ]
-        self.label = f"Gemini ({settings.gemini_model})"
+        self.models = [model] + [m for m in self.FALLBACK_MODELS if m != model]
+        self.label = f"Gemini ({model})"
 
     def complete(self, system: str, user: str) -> str:
         payload = {
@@ -118,9 +118,9 @@ def _extract_gemini_text(data: dict) -> str:
 class OllamaLLM(BaseLLM):
     name = "ollama"
 
-    def __init__(self) -> None:
-        self.host = settings.ollama_host.rstrip("/")
-        self.model = settings.ollama_model
+    def __init__(self, host: str | None = None, model: str | None = None) -> None:
+        self.host = (host or settings.ollama_host).rstrip("/")
+        self.model = model or settings.ollama_model
         self.label = f"Ollama ({self.model})"
 
     def complete(self, system: str, user: str) -> str:
@@ -190,50 +190,44 @@ class MockLLM(BaseLLM):
 
 
 def _mock_choose_tool(command: str) -> tuple[str, dict]:
+    """Keyword → tool mapping for the keyless demo LLM. It cannot resolve real
+    Gmail message ids, so email intents fall back to listing; it shines on the
+    local notes/tasks tools."""
     c = command.lower()
 
     def has(*words: str) -> bool:
         return any(w in c for w in words)
 
-    add = has("add", "create", "new", "save", "schedule", "remind", "write")
-    reply = has("reply", "respond", "draft", "compose")
+    add = has("add", "create", "new", "save", "schedule", "remind")
 
-    # Drafting an email reply — resolve the recipient to a real email id.
-    if reply and not has("note"):
-        target = _resolve_email_target(c)
-        if target is not None:
-            return "email_draft_reply", {
-                "email_id": target,
-                "message": _draft_body(command),
-            }
-        return "email_list", {}
-
-    if has("email", "inbox", "mail"):
+    if has("email", "inbox", "mail", "gmail"):
         if has("unread"):
-            return "email_list", {"unread_only": True}
+            return "gmail_list", {"unread_only": True}
         if has("search", "find", "from", "about"):
-            return "email_search", {"query": _keywords(command)}
-        return "email_list", {}
+            return "gmail_search", {"query": _keywords(command)}
+        return "gmail_list", {}
+
+    if has("reply", "respond", "draft", "compose"):
+        # A real message id can't be resolved without Gmail; list instead.
+        return "gmail_list", {}
+
+    if has("event", "calendar", "meeting", "appointment"):
+        if add:
+            title = _extract_quoted(command)
+            return "calendar_add", {
+                "title": title[0] if title else _clean_task_title(command),
+                "date": _extract_due(command),
+            }
+        return "calendar_list", {}
 
     if has("task", "todo", "to-do", "to do"):
         if add:
-            due, priority = _extract_due(command), _extract_priority(command)
             return "tasks_add", {
                 "title": _clean_task_title(command),
-                "due": due,
-                "priority": priority,
+                "due": _extract_due(command),
+                "priority": _extract_priority(command),
             }
         return "tasks_list", {}
-
-    if has("event", "calendar", "meeting", "agenda", "appointment"):
-        if add:
-            due = _extract_due(command)
-            title = _extract_quoted(command)
-            return "calendar_add_event", {
-                "title": title[0] if title else _clean_task_title(command),
-                "date": due,
-            }
-        return "calendar_list_events", {}
 
     if has("note"):
         if add:
@@ -249,39 +243,6 @@ def _mock_choose_tool(command: str) -> tuple[str, dict]:
 
     # Safe default: list notes.
     return "notes_list", {}
-
-
-def _resolve_email_target(lowered_command: str) -> str | None:
-    """Best-effort: match a name in the command to a sender in the mock inbox."""
-    try:
-        from tools import backends
-
-        for e in backends.email_list():
-            sender = e["from"].split("<", 1)[0].strip().lower()
-            for token in re.findall(r"[a-z]+", sender):
-                if len(token) > 2 and token in lowered_command:
-                    return e["id"]
-    except Exception:
-        return None
-    return None
-
-
-def _draft_body(command: str) -> str:
-    """Pull the intended message out of a 'reply ... telling/saying/that ...' command."""
-    m = re.search(
-        r"(?i)\b(telling|tell|saying|say|that|to say|with)\b\s+"
-        r"(?:her|him|them|me|us|you)?\s*[:,]?\s*(.+)$",
-        command,
-    )
-    if m:
-        body = m.group(2).strip().rstrip(".")
-        # Rephrase first-person 'I'll' into the drafted reply voice as-is.
-        return body[0].upper() + body[1:] + "." if body else _draft_fallback()
-    return _draft_fallback()
-
-
-def _draft_fallback() -> str:
-    return "Thanks for your email — I'll follow up shortly. (drafted in mock mode)"
 
 
 # --------------------------------------------------------------------------- #
@@ -355,15 +316,23 @@ def _short(text: str, n: int = 200) -> str:
 # --------------------------------------------------------------------------- #
 # Factory                                                                     #
 # --------------------------------------------------------------------------- #
-def build_llm() -> BaseLLM:
-    """Instantiate the configured provider, degrading to the mock LLM if the
-    real provider cannot be constructed (e.g. missing key)."""
-    provider = settings.llm_provider
+def build_llm(
+    provider: str | None = None,
+    api_key: str | None = None,
+    gemini_model: str | None = None,
+    ollama_host: str | None = None,
+    ollama_model: str | None = None,
+) -> BaseLLM:
+    """Instantiate the requested provider (falling back to global settings for
+    any unset field), degrading to the mock LLM if it cannot be constructed
+    (e.g. missing key). Callers pass per-session overrides; no args reproduces
+    the original env-driven behaviour."""
+    provider = provider or settings.llm_provider
     try:
         if provider == "gemini":
-            return GeminiLLM()
+            return GeminiLLM(api_key=api_key, model=gemini_model)
         if provider == "ollama":
-            return OllamaLLM()
+            return OllamaLLM(host=ollama_host, model=ollama_model)
     except LLMError:
         return MockLLM()
     return MockLLM()

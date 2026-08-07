@@ -16,9 +16,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+from typing import Callable
+
 from agent.llm import BaseLLM, LLMError, build_llm
 from config import settings
-from tools.mcp_client import MCPManager, ToolInfo
+from tools import catalog
+from tools.mcp_client import MCPManager, ToolContext, ToolInfo
 
 SYSTEM_PROMPT = """\
 You are a personal AI assistant that completes real tasks by calling tools.
@@ -50,6 +53,10 @@ class Step:
     observation: object
     source: str
     ok: bool
+    label: str = ""
+    summary: str = ""
+    tag: str = "read"
+    status: str = "done"  # done | declined | error
 
 
 @dataclass
@@ -61,93 +68,195 @@ class AgentResult:
     error: str | None = None
 
 
+@dataclass
+class PendingApproval:
+    """Returned by a run when the model wants to perform an approval-gated action
+    (send mail, change a calendar). The caller decides, then resumes the run."""
+
+    index: int
+    tool: str
+    args: dict
+    thought: str
+    label: str
+    description: str
+
+
+_LLM_UNAVAILABLE = (
+    "⚠️ The language model is unavailable, so I couldn't process that.\n\n"
+    "Reason: {reason}\n\n"
+    "Tip: open Settings to configure an API key (e.g. Gemini), run a local "
+    "Ollama, or leave both unset to use the built-in mock mode."
+)
+
+
 class Agent:
     def __init__(self, manager: MCPManager, llm: BaseLLM | None = None) -> None:
         self.mgr = manager
         self.llm = llm or build_llm()
 
-    # ------------------------------------------------------------------ #
-    def run(self, command: str) -> AgentResult:
-        command = (command or "").strip()
-        result = AgentResult(
-            answer="", llm_label=self.llm.label, transport=self.mgr.transport
-        )
-        if not command:
-            result.answer = "Please type a command, e.g. “what's on my calendar?”"
-            return result
+    def start(
+        self,
+        command: str,
+        context: ToolContext | None = None,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> "AgentRun":
+        """Begin a resumable run. Call `.advance()` to drive it; it returns a
+        `PendingApproval` when it needs a decision, or an `AgentResult` when done."""
+        return AgentRun(self, command, context, on_event)
 
-        tools = self.mgr.list_tools()
-        tools_desc = _render_tools(tools)
-        valid = {t.name for t in tools}
-        transcript: list[str] = []
+    def run(self, command: str, context: ToolContext | None = None) -> AgentResult:
+        """Convenience driver for non-interactive callers (tests, read-only use).
+        Any approval-gated action is DECLINED — this path never sends or writes."""
+        run = self.start(command, context)
+        outcome = run.advance()
+        while isinstance(outcome, PendingApproval):
+            outcome = run.advance(approved=False)
+        return outcome
+
+
+class AgentRun:
+    """One resumable execution of the agent loop. Emits trace events as it goes
+    and pauses (via a generator `yield`) whenever an action needs approval."""
+
+    def __init__(self, agent: Agent, command: str,
+                 context: ToolContext | None = None,
+                 on_event: Callable[[dict], None] | None = None) -> None:
+        self.agent = agent
+        self.command = (command or "").strip()
+        self.context = context
+        self.on_event = on_event
+        self.result = AgentResult(
+            answer="", llm_label=agent.llm.label, transport=agent.mgr.transport
+        )
+        self.pending: PendingApproval | None = None
+        self.finished = False
+        self._started = False
+
+        tools = agent.mgr.list_tools()
+        self._tools_desc = _render_tools(tools)
+        self._by_name = {t.name: t for t in tools}
+        self._transcript: list[str] = []
+        self._gen = self._iter()
+
+    # -- driving ----------------------------------------------------------- #
+    def advance(self, approved: bool | None = None):
+        """Run until the next approval pause or completion. Returns a
+        `PendingApproval` or the final `AgentResult`."""
+        if self.finished:
+            return self.result
+        try:
+            value = None if not self._started else approved
+            self._started = True
+            self.pending = self._gen.send(value)
+            return self.pending
+        except StopIteration:
+            self.finished = True
+            self.pending = None
+            return self.result
+
+    # -- the loop (generator; yields at approval points) ------------------- #
+    def _iter(self):
+        if not self.command:
+            self.result.answer = "Please type a command, e.g. “what's on my calendar?”"
+            return
+
+        llm, mgr = self.agent.llm, self.agent.mgr
 
         for step_no in range(1, settings.max_agent_steps + 1):
-            user_prompt = _build_user_prompt(command, tools_desc, transcript)
-
+            prompt = _build_user_prompt(self.command, self._tools_desc, self._transcript)
             try:
-                raw = self.llm.complete(SYSTEM_PROMPT, user_prompt)
+                raw = llm.complete(SYSTEM_PROMPT, prompt)
             except LLMError as ex:
-                result.error = str(ex)
-                result.answer = (
-                    "⚠️ The language model is unavailable, so I couldn't process that.\n\n"
-                    f"Reason: {ex}\n\n"
-                    "Tip: set a free GEMINI_API_KEY in .env, run a local Ollama, "
-                    "or leave both unset to use the built-in mock mode."
-                )
-                return result
+                self.result.error = str(ex)
+                self.result.answer = _LLM_UNAVAILABLE.format(reason=ex)
+                return
 
             action = _parse_action(raw)
-
-            # No parseable JSON → treat the model's prose as its final answer.
-            if action is None:
-                result.answer = raw.strip() or "(the model returned an empty response)"
-                return result
+            if action is None:  # prose, not JSON → treat as the final answer
+                self.result.answer = raw.strip() or "(the model returned an empty response)"
+                return
 
             thought = str(action.get("thought", "")).strip()
             name = str(action.get("action", "")).strip()
             action_input = action.get("action_input", {})
 
             if name.upper() == "FINAL" or name == "":
-                result.answer = _as_answer(action_input)
-                if not result.steps and not result.answer:
-                    result.answer = "(no answer produced)"
-                return result
+                self.result.answer = _as_answer(action_input) or "(no answer produced)"
+                return
 
-            # It's a tool call.
-            if name not in valid:
+            if name not in self._by_name:
                 observation = {
                     "error": f"'{name}' is not an available tool. "
-                    f"Choose from: {', '.join(sorted(valid))}."
+                    f"Choose from: {', '.join(sorted(self._by_name))}."
                 }
-                result.steps.append(
-                    Step(step_no, thought, name, _as_args(action_input),
-                         observation, source="—", ok=False)
-                )
-                transcript.append(
-                    _fmt_step(step_no, thought, name, action_input, observation)
-                )
+                self._record(step_no, thought, name, _as_args(action_input),
+                             observation, source="—", ok=False, status="error")
                 continue
 
+            tool = self._by_name[name]
             args = _as_args(action_input)
-            tool_result = self.mgr.call_tool(name, args)
+            self._emit({"type": "tool_start", "index": step_no, "tool": name,
+                        "label": catalog.label_for(name), "tag": tool.tag, "args": args})
+
+            # Approval gate: pause the run and hand control back to the caller.
+            if tool.tag == "confirm":
+                pend = PendingApproval(
+                    index=step_no, tool=name, args=args, thought=thought,
+                    label=catalog.label_for(name),
+                    description=catalog.describe_action(name, args),
+                )
+                # The terminal 'awaiting_approval' event (with a run_id for
+                # resuming) is emitted by the streaming layer, not here.
+                approved = yield pend
+                if not approved:
+                    observation = {"status": "declined",
+                                   "message": "The user declined this action, so "
+                                              "it was not performed."}
+                    self._record(step_no, thought, name, args, observation,
+                                 source="—", ok=False, status="declined",
+                                 label=catalog.label_for(name),
+                                 summary="Declined by user")
+                    self._emit({"type": "tool_end", "index": step_no, "tool": name,
+                                "ok": False, "status": "declined",
+                                "summary": "Declined by user"})
+                    continue
+
+            tool_result = mgr.call_tool(name, args, self.context)
             observation = tool_result.content
-            result.steps.append(
-                Step(step_no, thought, name, args, observation,
-                     source=tool_result.source, ok=tool_result.ok)
-            )
-            transcript.append(_fmt_step(step_no, thought, name, args, observation))
+            status = "done" if tool_result.ok else "error"
+            summary = catalog.summarize(name, observation)
+            self._record(step_no, thought, name, args, observation,
+                         source=tool_result.source, ok=tool_result.ok, status=status,
+                         label=catalog.label_for(name), summary=summary)
+            self._emit({"type": "tool_end", "index": step_no, "tool": name,
+                        "ok": tool_result.ok, "status": status, "summary": summary})
 
         # Hit the step cap without a FINAL — summarise what we have.
-        last = result.steps[-1] if result.steps else None
+        last = self.result.steps[-1] if self.result.steps else None
         if last is not None:
-            result.answer = (
+            self.result.answer = (
                 "I reached the step limit before finishing. Here is the most recent "
-                f"tool result from `{last.tool}`:\n\n```json\n"
-                f"{_json(last.observation)}\n```"
+                f"tool result from `{last.tool}`:\n\n```json\n{_json(last.observation)}\n```"
             )
         else:
-            result.answer = "I couldn't complete that within the step limit."
-        return result
+            self.result.answer = "I couldn't complete that within the step limit."
+
+    # -- helpers ----------------------------------------------------------- #
+    def _record(self, index, thought, tool, args, observation, source, ok,
+                status="done", label="", summary="") -> None:
+        tag = self._by_name[tool].tag if tool in self._by_name else "read"
+        self.result.steps.append(
+            Step(index, thought, tool, args, observation, source, ok,
+                 label=label, summary=summary, tag=tag, status=status)
+        )
+        self._transcript.append(_fmt_step(index, thought, tool, args, observation))
+
+    def _emit(self, event: dict) -> None:
+        if self.on_event:
+            try:
+                self.on_event(event)
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +269,8 @@ def _render_tools(tools: list[ToolInfo]) -> str:
         required = set((t.input_schema or {}).get("required", []))
         params = []
         for pname, pinfo in props.items():
+            if pname in catalog.RESERVED_PARAMS:  # injected server-side; hide from LLM
+                continue
             typ = pinfo.get("type", "any")
             if pname in required:
                 params.append(f"{pname}: {typ}")
@@ -167,7 +278,8 @@ def _render_tools(tools: list[ToolInfo]) -> str:
                 default = pinfo.get("default", None)
                 params.append(f"{pname}: {typ} = {json.dumps(default)}")
         sig = ", ".join(params)
-        lines.append(f"- {t.name}({sig}) — {t.description}")
+        flag = "  ⚠️ requires approval" if t.tag == "confirm" else ""
+        lines.append(f"- {t.name}({sig}) — {t.description}{flag}")
     return "\n".join(lines)
 
 

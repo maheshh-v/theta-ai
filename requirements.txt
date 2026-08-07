@@ -1,11 +1,13 @@
-# Personal AI Assistant — pinned dependencies (tested versions).
-# Python 3.10+ recommended (developed and verified on 3.12).
+# Theta — runtime dependencies. Python 3.10+ (developed and verified on 3.12).
 
-mcp==2.0.0              # Model Context Protocol SDK (servers + client)
-gradio==6.22.0          # Web chat UI
-requests==2.34.2        # REST calls to Gemini / Ollama
-python-dotenv==1.2.2    # Load GEMINI_API_KEY etc. from a local .env
+mcp>=1.2.0             # Model Context Protocol SDK (tool servers + client)
+fastapi>=0.110         # Web framework (chat API, OAuth, static SPA)
+uvicorn[standard]>=0.27  # ASGI server
+requests>=2.31         # REST calls to Gemini / Ollama and the Google APIs
+python-dotenv>=1.0     # Load configuration from a local .env
+cryptography>=42.0     # Encrypts stored OAuth tokens and API keys at rest
 
 # Notes:
-# - No LLM SDK is required: Gemini and Ollama are called over plain REST.
-# - With no API key set, the app runs on a built-in mock LLM (demo mode).
+# - No LLM SDK and no Google SDK: Gemini, Ollama, Gmail and Calendar are all
+#   called over plain REST with `requests`.
+# - Dev/test extras (pytest, httpx) live in requirements-dev.txt.

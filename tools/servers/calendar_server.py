@@ -1,49 +1,42 @@
 """
-MCP server: Calendar + Tasks tool.
+MCP server: Google Calendar (real, via the Google API).
 
-Manages local events and to-do tasks stored in ../../data/calendar.json.
-Supports viewing/adding events and viewing/adding/completing tasks.
+Stateless — the caller's OAuth access token is injected by the MCP client
+manager at call time. Adding or updating events changes the user's real
+calendar, so those tools are approval-gated by the agent.
 
-Run standalone for a quick smoke test:
-    python tools/servers/calendar_server.py
+Run standalone for a smoke test:  python tools/servers/calendar_server.py
 """
 
 from _common import make_server  # noqa: E402  (adds project root to sys.path)
-from tools import backends  # noqa: E402
+from tools import google_tools  # noqa: E402
 
 mcp = make_server("calendar")
 
 
 @mcp.tool()
-def calendar_list_events(date: str = "") -> list:
-    """List calendar events. Optionally filter to one date (YYYY-MM-DD)."""
-    return backends.calendar_list_events(date)
+def calendar_list(access_token: str, date: str = "") -> list:
+    """List upcoming calendar events, or all events on one YYYY-MM-DD date."""
+    return google_tools.calendar_list(access_token, date)
 
 
 @mcp.tool()
-def calendar_add_event(
-    title: str, date: str, time: str = "", location: str = "", notes: str = ""
-) -> dict:
-    """Add a calendar event. date=YYYY-MM-DD, time=HH:MM (24h)."""
-    return backends.calendar_add_event(title, date, time, location, notes)
+def calendar_add(access_token: str, title: str, date: str, time: str = "",
+                 duration_min: int = 60, location: str = "",
+                 description: str = "") -> dict:
+    """Add an event. date=YYYY-MM-DD, time=HH:MM (24h; omit for an all-day
+    event). Creates a real event on the user's primary calendar."""
+    return google_tools.calendar_add(access_token, title, date, time,
+                                     duration_min, location, description)
 
 
 @mcp.tool()
-def tasks_list(include_done: bool = False) -> list:
-    """List to-do tasks. Set include_done=True to also show completed tasks."""
-    return backends.tasks_list(include_done)
-
-
-@mcp.tool()
-def tasks_add(title: str, due: str = "", priority: str = "medium") -> dict:
-    """Add a to-do task. due=YYYY-MM-DD; priority is low/medium/high."""
-    return backends.tasks_add(title, due, priority)
-
-
-@mcp.tool()
-def tasks_complete(task_id: str) -> dict:
-    """Mark a to-do task as done by its id (e.g. 't1')."""
-    return backends.tasks_complete(task_id)
+def calendar_update(access_token: str, event_id: str, title: str = "",
+                    date: str = "", time: str = "", location: str = "",
+                    description: str = "") -> dict:
+    """Update an existing event by id. Only the fields you provide are changed."""
+    return google_tools.calendar_update(access_token, event_id, title, date,
+                                        time, location, description)
 
 
 if __name__ == "__main__":

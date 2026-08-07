@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+data/.secret_key
+data/sessions.enc
+data/sessions.enc.tmp
+.pytest_cache/
+tests/
+*.md
+!README.md

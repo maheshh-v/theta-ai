@@ -21,13 +21,13 @@ import sys
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import Callable, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from config import settings
-from tools import tool_specs
+from tools import catalog, tool_specs
 
 
 @dataclass
@@ -38,6 +38,27 @@ class ToolInfo:
     description: str
     input_schema: dict
     server: str
+    tag: str = "read"  # "read" (safe) or "confirm" (needs human approval)
+
+
+@dataclass
+class ToolContext:
+    """Per-request execution context handed to `call_tool`. Carries a provider
+    for the current session's Google access token so the manager can inject it
+    into Gmail/Calendar calls without the LLM ever seeing it."""
+
+    google_token_provider: Optional[Callable[[], Optional[str]]] = None
+
+    def google_token(self) -> Optional[str]:
+        return self.google_token_provider() if self.google_token_provider else None
+
+
+def _maybe_json(text: str):
+    """Parse a text block as JSON, or return the raw string on failure."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
 
 
 @dataclass
@@ -59,7 +80,8 @@ def _server_specs() -> list[tuple[str, str]]:
     d = settings.servers_dir
     return [
         ("notes", str(d / "notes_server.py")),
-        ("email", str(d / "email_server.py")),
+        ("tasks", str(d / "tasks_server.py")),
+        ("gmail", str(d / "gmail_server.py")),
         ("calendar", str(d / "calendar_server.py")),
     ]
 
@@ -93,6 +115,7 @@ class MCPManager:
                 description=spec["description"],
                 input_schema=tool_specs.spec_to_input_schema(spec),
                 server=spec["server"],
+                tag=catalog.tag_for(spec["name"]),
             )
             self._fallback[spec["name"]] = (spec["fn"], info)
 
@@ -169,6 +192,7 @@ class MCPManager:
                                     description=t.description or "",
                                     input_schema=schema,
                                     server=name,
+                                    tag=catalog.tag_for(t.name),
                                 )
                             )
                             self._tool_server[t.name] = name
@@ -206,13 +230,34 @@ class MCPManager:
     def list_tools(self) -> list[ToolInfo]:
         return list(self._tools)
 
-    def call_tool(self, name: str, arguments: dict | None = None) -> ToolResult:
-        arguments = arguments or {}
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict | None = None,
+        context: "ToolContext | None" = None,
+    ) -> ToolResult:
+        arguments = dict(arguments or {})
         if name not in self._tool_server and name not in self._fallback:
             return ToolResult(ok=False, content={"error": f"Unknown tool '{name}'."})
 
+        server = self._tool_server.get(name) or self._server_of(name)
+
+        # Inject the session's Google token for auth'd tools (never from the LLM).
+        if catalog.needs_auth(server):
+            token = context.google_token() if context else None
+            if not token:
+                return ToolResult(
+                    ok=False,
+                    source="—",
+                    content={
+                        "error": "not_connected",
+                        "message": "Connect your Google account in the Accounts "
+                        "tab to use Gmail and Calendar.",
+                    },
+                )
+            arguments["access_token"] = token
+
         # Prefer the live MCP session when the tool belongs to a connected server.
-        server = self._tool_server.get(name)
         session = self._sessions.get(server) if server else None
         if session is not None and self._loop is not None:
             try:
@@ -241,6 +286,10 @@ class MCPManager:
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
+    def _server_of(self, name: str) -> str | None:
+        entry = self._fallback.get(name)
+        return entry[1].server if entry else None
+
     def _call_fallback(self, name: str, arguments: dict) -> ToolResult | None:
         entry = self._fallback.get(name)
         if entry is None:
@@ -270,18 +319,23 @@ class MCPManager:
                 content = content["result"]
             return ToolResult(ok=not is_error, content=content, source=source)
 
-        # Otherwise collect text blocks and try to parse JSON.
-        texts = []
-        for block in getattr(result, "content", []) or []:
-            text = getattr(block, "text", None)
-            if text is not None:
-                texts.append(text)
-        joined = "\n".join(texts).strip()
-        try:
-            parsed = json.loads(joined)
-        except Exception:
-            parsed = joined
-        return ToolResult(ok=not is_error, content=parsed, source=source)
+        # Otherwise collect text blocks. The high-level MCP server emits ONE text
+        # block per item for list returns, so parse each block and, when there
+        # are several, return them as a list (not a broken concatenation).
+        texts = [
+            block.text
+            for block in getattr(result, "content", []) or []
+            if getattr(block, "text", None) is not None
+        ]
+        if not texts:
+            return ToolResult(ok=not is_error, content="", source=source)
+        if len(texts) == 1:
+            return ToolResult(ok=not is_error, content=_maybe_json(texts[0]), source=source)
+        return ToolResult(
+            ok=not is_error,
+            content=[_maybe_json(t) for t in texts],
+            source=source,
+        )
 
     def status(self) -> dict:
         return {

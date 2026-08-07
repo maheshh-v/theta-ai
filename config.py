@@ -54,10 +54,40 @@ class Settings:
     # Agent loop
     max_agent_steps: int = int(os.getenv("MAX_AGENT_STEPS", "5"))
 
+    # --- Server ---
+    server_host: str = os.getenv(
+        "THETA_HOST", os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    ).strip()
+    server_port: int = int(os.getenv("THETA_PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
+    # Public base URL of the app (used to build OAuth redirect URIs when hosted).
+    public_base_url: str = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+    # --- Security / sessions ---
+    # A stable secret enables durable encryption of tokens/keys at rest. If unset,
+    # a local key is generated and persisted for dev (see server/security.py).
+    secret_key: str = os.getenv("THETA_SECRET_KEY", "").strip()
+    session_cookie: str = os.getenv("THETA_SESSION_COOKIE", "theta_session").strip()
+    session_persist: bool = os.getenv("THETA_SESSION_PERSIST", "1").strip().lower() not in {
+        "0", "false", "no", "",
+    }
+    cookie_secure: bool = os.getenv("THETA_COOKIE_SECURE", "").strip().lower() in {
+        "1", "true", "yes",
+    }
+
+    # --- Google OAuth (Gmail + Calendar) ---
+    google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    google_client_secret: str = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    # If blank, computed from public_base_url / host:port at runtime.
+    google_redirect_uri: str = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+
     # Paths
     project_root: Path = PROJECT_ROOT
     data_dir: Path = DATA_DIR
     servers_dir: Path = SERVERS_DIR
+
+    @property
+    def google_configured(self) -> bool:
+        return bool(self.google_client_id and self.google_client_secret)
 
     def summary(self) -> str:
         if self.llm_provider == "gemini":

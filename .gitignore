@@ -1,5 +1,8 @@
 # Secrets
 .env
+data/.secret_key
+data/sessions.enc
+data/sessions.enc.tmp
 
 # Python
 __pycache__/
