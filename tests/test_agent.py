@@ -1,141 +1,215 @@
-"""Agent loop: approval gating, token injection, and reserved-param hiding."""
+"""
+The agent loop: tool dispatch, the dynamic approval gate, context compression,
+and history.
+
+The gate tests are the interesting ones. `browser_click` is the same tool
+whether it opens an "About us" link or places an order, so approval cannot be a
+property of the tool — it is decided per call from the live page.
+"""
+
+from __future__ import annotations
 
 import json
 
-import pytest
-
-import integrations.google._http as http
-from agent.llm import BaseLLM
-from agent.orchestrator import Agent, AgentResult, PendingApproval, _render_tools
-from tools import catalog
+from agent.orchestrator import Agent, PendingApproval
 from tools.mcp_client import ToolContext
 
 
-class _Resp:
-    def __init__(self, code, data):
-        self.status_code = code
-        self._data = data
-        self.content = b"{}"
-
-    def json(self):
-        return self._data
+def action(tool: str, **args) -> str:
+    return json.dumps({"thought": "t", "action": tool, "action_input": args})
 
 
-class _ScriptLLM(BaseLLM):
-    label = "ScriptLLM"
-    name = "script"
-
-    def __init__(self, tool_json):
-        self.tool_json = tool_json
-
-    def complete(self, system, user):
-        import json as _json
-        if "(none yet)" not in user.split("WORK SO FAR:", 1)[1]:
-            return _json.dumps({"action": "FINAL", "action_input": "Done."})
-        return self.tool_json
+FINAL = json.dumps({"thought": "t", "action": "FINAL", "action_input": "Here you go."})
+NAV = action("browser_navigate", url="https://e.example")
 
 
-def _script(tool_json):
-    return _ScriptLLM(tool_json)
+# --------------------------------------------------------------------------- #
+# Dispatch                                                                    #
+# --------------------------------------------------------------------------- #
+def test_runs_a_browser_action_then_answers(manager, tool_then_final, page):
+    result = Agent(manager, tool_then_final(NAV)).run("open the site")
+
+    assert result.answer == "All done."
+    assert [s.tool for s in result.steps] == ["browser_navigate"]
+    assert page.url == "https://e.example"
 
 
-# ---- token injection ---------------------------------------------------- #
-def test_auth_tool_without_token_is_not_connected(manager):
-    ctx = ToolContext(google_token_provider=lambda: None)
-    r = manager.call_tool("gmail_list", {"unread_only": True}, ctx)
-    assert r.ok is False
-    assert r.content["error"] == "not_connected"
+def test_final_without_any_tool(manager, script_llm):
+    result = Agent(manager, script_llm(FINAL)).run("hello")
+
+    assert result.answer == "Here you go."
+    assert result.steps == []
 
 
-def test_auth_tool_injects_token(manager, monkeypatch):
-    seen = {}
-
-    def request(method, url, headers=None, timeout=None, params=None, json=None):
-        seen["auth"] = headers["Authorization"]
-        if url.endswith("/messages"):
-            return _Resp(200, {"messages": []})
-        return _Resp(200, {})
-    monkeypatch.setattr(http.requests, "request", request)
-
-    ctx = ToolContext(google_token_provider=lambda: "FRESH")
-    r = manager.call_tool("gmail_list", {}, ctx)
-    assert r.ok is True
-    assert seen["auth"] == "Bearer FRESH"
+def test_prose_reply_becomes_the_answer(manager, script_llm):
+    assert Agent(manager, script_llm("Just talking.")).run("hi").answer == "Just talking."
 
 
-def test_local_tool_needs_no_token(manager):
-    r = manager.call_tool("tasks_list", {})
-    assert r.ok is True
-    assert isinstance(r.content, list)
+def test_unknown_tool_is_reported_back_to_the_model(manager, script_llm):
+    result = Agent(manager, script_llm(action("teleport"), FINAL)).run("go")
+
+    assert result.steps[0].status == "error"
+    assert "not an available tool" in result.steps[0].observation["error"]
+    assert result.answer == "Here you go."
 
 
-# ---- reserved param hidden from the LLM --------------------------------- #
-def test_reserved_param_hidden_but_present_in_schema(manager):
-    tools = {t.name: t for t in manager.list_tools()}
-    assert "access_token" in tools["gmail_list"].input_schema["properties"]
-    rendered = _render_tools(list(tools.values()))
-    assert "access_token" not in rendered
-    assert "requires approval" in rendered  # confirm tools flagged
+def test_step_cap_ends_the_run(manager, script_llm, monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "max_agent_steps", 3, raising=False)
+
+    result = Agent(manager, script_llm(NAV)).run("loop forever")
+
+    assert len(result.steps) == 3
+    assert "3-step limit" in result.answer
 
 
-def test_tags_assigned(manager):
-    tools = {t.name: t for t in manager.list_tools()}
-    assert tools["gmail_send_reply"].tag == "confirm"
-    assert tools["gmail_list"].tag == "read"
-    assert catalog.tag_for("calendar_add") == "confirm"
+def test_llm_failure_is_explained_not_swallowed(manager):
+    from agent.llm import BaseLLM, LLMError
+
+    class Broken(BaseLLM):
+        label = "Broken"
+
+        def complete(self, system, user, max_tokens=4096):
+            raise LLMError("quota exceeded")
+
+    result = Agent(manager, Broken()).run("anything")
+
+    assert result.error == "quota exceeded"
+    assert "quota exceeded" in result.answer and "Settings" in result.answer
 
 
-# ---- approval gating ---------------------------------------------------- #
-def _send_action():
-    return json.dumps({"thought": "send", "action": "gmail_send_reply",
-                       "action_input": {"message_id": "m1", "body": "hi"}})
+# --------------------------------------------------------------------------- #
+# The dynamic approval gate                                                   #
+# --------------------------------------------------------------------------- #
+def test_a_harmless_click_does_not_interrupt(manager, script_llm, page):
+    """Ref 3 is an 'About us' link — no reason to stop the user."""
+    llm = script_llm(NAV, action("browser_click", ref=3), FINAL)
+    result = Agent(manager, llm).run("open the about page")
+
+    assert not any(s.status == "declined" for s in result.steps)
+    assert page.clicked == ["About us"]
 
 
-def test_read_only_completes_without_pause(manager):
-    llm = _script(json.dumps({"thought": "list", "action": "notes_list",
-                              "action_input": {}}))
-    out = Agent(manager, llm).start("list notes").advance()
-    assert isinstance(out, AgentResult)
-    assert out.steps[0].tool == "notes_list"
+def test_a_consequential_click_pauses(manager, script_llm):
+    """Ref 5 is 'Place order' — the same tool, but this one waits for a human."""
+    llm = script_llm(NAV, action("browser_click", ref=5), FINAL)
+    run = Agent(manager, llm).start("buy it")
+
+    outcome = run.advance()
+    while not isinstance(outcome, PendingApproval) and outcome is not run.result:
+        outcome = run.advance()
+
+    assert isinstance(outcome, PendingApproval)
+    assert outcome.tool == "browser_click"
+    assert "Place order" in outcome.description
 
 
-def test_confirm_tool_pauses_then_approves(manager, monkeypatch):
-    def request(method, url, headers=None, timeout=None, params=None, json=None):
-        if url.endswith("/profile"):
-            return _Resp(200, {"emailAddress": "me@x.com"})
-        if "/messages/m1" in url:
-            return _Resp(200, {"id": "m1", "threadId": "t1", "payload": {"headers": [
-                {"name": "From", "value": "P <p@x.com>"},
-                {"name": "Subject", "value": "Hi"},
-                {"name": "Message-ID", "value": "<a>"}]}})
-        if url.endswith("/messages/send"):
-            return _Resp(200, {"id": "sent1"})
-        return _Resp(200, {})
-    monkeypatch.setattr(http.requests, "request", request)
+def test_rejecting_a_consequential_click_skips_it(manager, script_llm, page):
+    llm = script_llm(NAV, action("browser_click", ref=5), FINAL)
+    run = Agent(manager, llm).start("buy it")
+    outcome = run.advance()
+    while isinstance(outcome, PendingApproval):
+        outcome = run.advance(approved=False)
 
-    ctx = ToolContext(google_token_provider=lambda: "TOKEN")
-    run = Agent(manager, _script(_send_action())).start("reply and send", ctx)
-
-    pending = run.advance()
-    assert isinstance(pending, PendingApproval)
-    assert pending.tool == "gmail_send_reply"
-
-    result = run.advance(approved=True)
-    assert isinstance(result, AgentResult)
-    assert run.result.steps[0].status == "done"
-    assert run.result.steps[0].summary == "Reply sent"
+    assert any(s.status == "declined" for s in outcome.steps)
+    assert page.clicked == []          # nothing was ordered
 
 
-def test_confirm_tool_reject_declines(manager):
-    ctx = ToolContext(google_token_provider=lambda: "TOKEN")
-    run = Agent(manager, _script(_send_action())).start("reply and send", ctx)
-    run.advance()
-    result = run.advance(approved=False)
-    assert result.steps[0].status == "declined"
-    assert result.steps[0].ok is False
+def test_approving_lets_it_through(manager, script_llm, page):
+    llm = script_llm(NAV, action("browser_click", ref=5), FINAL)
+    run = Agent(manager, llm).start("buy it")
+    outcome = run.advance()
+    while isinstance(outcome, PendingApproval):
+        outcome = run.advance(approved=True)
+
+    assert page.clicked == ["Place order"]
 
 
-def test_run_convenience_auto_declines_confirm(manager):
-    ctx = ToolContext(google_token_provider=lambda: "TOKEN")
-    result = Agent(manager, _script(_send_action())).run("reply and send", ctx)
-    assert result.steps[0].status == "declined"  # never sends without approval
+def test_typing_and_submitting_pauses_even_in_a_plain_field(manager, script_llm):
+    """Pressing Enter submits the form, whatever the field is called."""
+    llm = script_llm(NAV, action("browser_type", ref=1, text="hi", submit=True), FINAL)
+    run = Agent(manager, llm).start("search")
+    outcome = run.advance()
+    while not isinstance(outcome, PendingApproval) and outcome is not run.result:
+        outcome = run.advance()
+
+    assert isinstance(outcome, PendingApproval)
+    assert "Submit" in outcome.description
+
+
+def test_typing_without_submitting_does_not_pause(manager, script_llm, page):
+    llm = script_llm(NAV, action("browser_type", ref=1, text="solar"), FINAL)
+    Agent(manager, llm).run("type into the box")
+
+    assert page.typed == [("Search", "solar")]
+
+
+def test_a_password_field_is_refused_by_the_tool(manager, script_llm, page):
+    llm = script_llm(NAV, action("browser_type", ref=4, text="hunter2"), FINAL)
+    result = Agent(manager, llm).run("log in")
+
+    typed_step = next(s for s in result.steps if s.tool == "browser_type")
+    assert not typed_step.ok
+    assert "credential" in typed_step.observation["error"]
+    assert page.typed == []
+
+
+# --------------------------------------------------------------------------- #
+# Context compression                                                         #
+# --------------------------------------------------------------------------- #
+def test_only_the_latest_page_is_carried_in_the_prompt(manager, script_llm):
+    """Old snapshots are dead weight and their refs are actively misleading."""
+    llm = script_llm(NAV, action("browser_click", ref=3), action("browser_read"), FINAL)
+    Agent(manager, llm).run("do things")
+
+    last_prompt = llm.calls[-1][1]
+    assert last_prompt.count("CURRENT PAGE:") <= 1
+    assert "Step 1: browser_navigate" in last_prompt      # history is a one-liner
+
+
+def test_reserved_parameters_are_hidden_from_the_model(manager, script_llm):
+    llm = script_llm(FINAL)
+    Agent(manager, llm).run("hi")
+    _system, user = llm.calls[0]
+
+    assert "browser_click(ref" in user
+    assert "shot_path" not in user
+    assert "search_api_key" not in user
+
+
+def test_replay_only_tools_are_hidden_from_the_model(manager, script_llm):
+    llm = script_llm(FINAL)
+    Agent(manager, llm).run("hi")
+
+    assert "browser_step" not in llm.calls[0][1]
+
+
+def test_tools_are_grouped_by_capability(manager, script_llm):
+    llm = script_llm(FINAL)
+    Agent(manager, llm).run("hi")
+    user = llm.calls[0][1]
+
+    assert "[browser]" in user and "[workspace]" in user
+
+
+def test_history_reaches_the_prompt(manager, script_llm):
+    llm = script_llm(FINAL)
+    Agent(manager, llm).run(
+        "and the next one?",
+        history=[{"role": "user", "content": "open example.com"},
+                 {"role": "assistant", "content": "Opened it."}],
+    )
+
+    assert "CONVERSATION SO FAR" in llm.calls[0][1]
+    assert "open example.com" in llm.calls[0][1]
+
+
+def test_events_carry_what_the_recorder_needs(manager, script_llm, page):
+    events: list[dict] = []
+    llm = script_llm(NAV, action("browser_click", ref=3), FINAL)
+    Agent(manager, llm).start("go", ToolContext(), on_event=events.append).advance()
+
+    ends = [e for e in events if e["type"] == "tool_end"]
+    click = next(e for e in ends if e["tool"] == "browser_click")
+    assert click["target"]["selectors"] == ["#about"]      # for Playbook recording
+    assert click["url"] == "https://e.example"

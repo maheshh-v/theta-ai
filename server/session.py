@@ -1,10 +1,10 @@
 """
 Server-side session store.
 
-A random session id lives in an **encrypted cookie**; the actual data (Google
-OAuth tokens, per-user LLM settings) stays server-side, so tokens never travel
-to the browser. The whole store is encrypted at rest on disk (Fernet) so a
-restart keeps people signed in. Secret values are registered with the log
+A random session id lives in an **encrypted cookie**; the actual data (API keys,
+per-user preferences, conversation history) stays server-side, so a key never
+travels to the browser. The whole store is encrypted at rest on disk (Fernet) so
+a restart keeps settings intact. Secret values are registered with the log
 scrubber the moment they are set.
 
 The `SessionMiddleware` attaches a ready-to-use `Session` to every request as
@@ -25,7 +25,7 @@ from config import settings
 from server import security
 
 # Keys whose values are secrets: registered for log-scrubbing, masked in the UI.
-SECRET_KEYS = {"google_token", "llm_api_key"}
+SECRET_KEYS = {"llm_api_key", "search_api_key"}
 
 _COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 

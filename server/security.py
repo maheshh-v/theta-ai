@@ -3,7 +3,7 @@ Security primitives: encryption-at-rest, secret masking, and log scrubbing.
 
 Three jobs, all small:
 
-* **Encrypt** anything we persist (OAuth tokens, user-supplied LLM keys) with
+* **Encrypt** anything we persist (user-supplied model and search API keys) with
   Fernet symmetric encryption. The key comes from ``THETA_SECRET_KEY``; for local
   development we generate one and persist it so sessions survive a restart.
 * **Mask** secrets for display (``sk-abcd••••••wxyz``) so the UI can show that a

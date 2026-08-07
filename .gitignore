@@ -12,6 +12,13 @@ __pycache__/
 venv/
 env/
 
+# The user's own data, not source: run traces and screenshots, saved
+# automations, files the agent produced, and research briefs.
+data/runs/
+data/playbooks/
+data/workspace/
+data/briefs/
+
 # Local scratch / OS
 *.tmp
 data/*.json.tmp
@@ -22,4 +29,3 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.gradio/

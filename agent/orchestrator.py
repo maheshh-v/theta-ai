@@ -1,47 +1,32 @@
 """
 The agent loop.
 
-A small, transparent ReAct-style controller (the same shape LangGraph builds
-for tool-calling agents): on each step the LLM emits a JSON action — either call
-a tool or finish — and we execute tool calls over MCP, feed the observation
-back, and repeat until the model produces a FINAL answer or we hit the step cap.
+A small, transparent ReAct-style controller: on each step the model emits one
+JSON action — call a tool, or finish — and we execute it, feed the observation
+back, and repeat until it produces a FINAL answer or hits the step cap.
 
-Every step (thought, chosen tool, arguments, observation, and whether it came
-from MCP or the fallback) is recorded in `AgentResult.steps` so the UI can show
-exactly how the assistant reasoned.
+Two properties matter beyond the basic loop:
+
+* **Resumable.** When the model chooses an approval-gated tool the run pauses
+  (via a generator `yield`) and hands control back to the caller, who approves or
+  rejects and resumes the same run. That is what makes `research` a decision the
+  user makes rather than something that happens to them.
+* **Traceable.** Every step — thought, tool, arguments, observation, and where it
+  ran — lands in `AgentResult.steps`, so the UI can show exactly what happened.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-
 from typing import Callable
 
-from agent.llm import BaseLLM, LLMError, build_llm
+from agent.llm import BaseLLM, LLMError
+from agent.parsing import parse_object
+from agent.prompts import system_prompt
 from config import settings
 from tools import catalog
 from tools.mcp_client import MCPManager, ToolContext, ToolInfo
-
-SYSTEM_PROMPT = """\
-You are a personal AI assistant that completes real tasks by calling tools.
-You have NO direct access to the user's data — to read or change anything you
-must call a tool.
-
-On each turn respond with EXACTLY ONE JSON object and nothing else:
-{
-  "thought": "<1-2 sentences: what to do next and why>",
-  "action": "<a tool name from AVAILABLE TOOLS, or the literal string FINAL>",
-  "action_input": <an object of arguments for the tool, OR (when action is FINAL) a string: your final answer to the user>
-}
-
-Rules:
-- Use ONLY tools listed in AVAILABLE TOOLS, with valid arguments.
-- Prefer the fewest calls needed; often a single tool call is enough.
-- Base every answer on tool observations — never invent emails, events, or notes.
-- When you have what you need, use action "FINAL" with a clear, friendly reply.
-- If the user just chats or asks something no tool covers, you may answer with FINAL directly.
-"""
 
 
 @dataclass
@@ -70,8 +55,8 @@ class AgentResult:
 
 @dataclass
 class PendingApproval:
-    """Returned by a run when the model wants to perform an approval-gated action
-    (send mail, change a calendar). The caller decides, then resumes the run."""
+    """Returned by a run when the model wants to perform an approval-gated action.
+    The caller decides, then resumes the run."""
 
     index: int
     tool: str
@@ -82,49 +67,62 @@ class PendingApproval:
 
 
 _LLM_UNAVAILABLE = (
-    "⚠️ The language model is unavailable, so I couldn't process that.\n\n"
-    "Reason: {reason}\n\n"
-    "Tip: open Settings to configure an API key (e.g. Gemini), run a local "
-    "Ollama, or leave both unset to use the built-in mock mode."
+    "⚠️ I couldn't reach the language model, so I can't answer that.\n\n"
+    "**Reason:** {reason}\n\n"
+    "Open **Settings → Model** to add an API key or point Theta at a local Ollama."
 )
 
 
 class Agent:
-    def __init__(self, manager: MCPManager, llm: BaseLLM | None = None) -> None:
+    def __init__(self, manager: MCPManager, llm: BaseLLM) -> None:
         self.mgr = manager
-        self.llm = llm or build_llm()
+        self.llm = llm
 
     def start(
         self,
         command: str,
         context: ToolContext | None = None,
         on_event: Callable[[dict], None] | None = None,
+        history: list[dict] | None = None,
     ) -> "AgentRun":
-        """Begin a resumable run. Call `.advance()` to drive it; it returns a
+        """Begin a resumable run. Call `.advance()` to drive it: it returns a
         `PendingApproval` when it needs a decision, or an `AgentResult` when done."""
-        return AgentRun(self, command, context, on_event)
+        return AgentRun(self, command, context, on_event, history)
 
-    def run(self, command: str, context: ToolContext | None = None) -> AgentResult:
-        """Convenience driver for non-interactive callers (tests, read-only use).
-        Any approval-gated action is DECLINED — this path never sends or writes."""
-        run = self.start(command, context)
+    def run(
+        self,
+        command: str,
+        context: ToolContext | None = None,
+        history: list[dict] | None = None,
+        auto_approve: bool = False,
+    ) -> AgentResult:
+        """Convenience driver for non-interactive callers. Approval-gated actions
+        are declined unless `auto_approve` is set."""
+        run = self.start(command, context, history=history)
         outcome = run.advance()
         while isinstance(outcome, PendingApproval):
-            outcome = run.advance(approved=False)
+            outcome = run.advance(approved=auto_approve)
         return outcome
 
 
 class AgentRun:
-    """One resumable execution of the agent loop. Emits trace events as it goes
-    and pauses (via a generator `yield`) whenever an action needs approval."""
+    """One resumable execution of the agent loop."""
 
-    def __init__(self, agent: Agent, command: str,
-                 context: ToolContext | None = None,
-                 on_event: Callable[[dict], None] | None = None) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        command: str,
+        context: ToolContext | None = None,
+        on_event: Callable[[dict], None] | None = None,
+        history: list[dict] | None = None,
+        max_steps: int | None = None,
+    ) -> None:
         self.agent = agent
         self.command = (command or "").strip()
         self.context = context
         self.on_event = on_event
+        self.history = history or []
+        self.max_steps = max_steps or settings.max_agent_steps
         self.result = AgentResult(
             answer="", llm_label=agent.llm.label, transport=agent.mgr.transport
         )
@@ -135,19 +133,27 @@ class AgentRun:
         tools = agent.mgr.list_tools()
         self._tools_desc = _render_tools(tools)
         self._by_name = {t.name: t for t in tools}
-        self._transcript: list[str] = []
+        # Which page elements will pause for approval, from the latest observation.
+        self._gates: dict = {}
         self._gen = self._iter()
 
+        # Let tools stream their own progress into this run's event channel.
+        if context is not None and context.on_progress is None:
+            context.on_progress = self._emit
+
     # -- driving ----------------------------------------------------------- #
-    def advance(self, approved: bool | None = None):
-        """Run until the next approval pause or completion. Returns a
-        `PendingApproval` or the final `AgentResult`."""
+    def advance(self, approved: bool | None = None, args: dict | None = None):
+        """Run until the next approval pause or completion.
+
+        `args` lets the approver hand back *edited* arguments — the user can
+        rewrite the research plan on the approval card before starting it.
+        """
         if self.finished:
             return self.result
         try:
-            value = None if not self._started else approved
+            decision = None if not self._started else {"approved": approved, "args": args}
             self._started = True
-            self.pending = self._gen.send(value)
+            self.pending = self._gen.send(decision)
             return self.pending
         except StopIteration:
             self.finished = True
@@ -157,22 +163,24 @@ class AgentRun:
     # -- the loop (generator; yields at approval points) ------------------- #
     def _iter(self):
         if not self.command:
-            self.result.answer = "Please type a command, e.g. “what's on my calendar?”"
+            self.result.answer = "Ask me a question and I'll research it."
             return
 
         llm, mgr = self.agent.llm, self.agent.mgr
 
-        for step_no in range(1, settings.max_agent_steps + 1):
-            prompt = _build_user_prompt(self.command, self._tools_desc, self._transcript)
+        for step_no in range(1, self.max_steps + 1):
+            prompt = _build_user_prompt(
+                self.command, self._tools_desc, self.result.steps, self.history
+            )
             try:
-                raw = llm.complete(SYSTEM_PROMPT, prompt)
+                raw = llm.complete(system_prompt(), prompt)
             except LLMError as ex:
                 self.result.error = str(ex)
                 self.result.answer = _LLM_UNAVAILABLE.format(reason=ex)
                 return
 
-            action = _parse_action(raw)
-            if action is None:  # prose, not JSON → treat as the final answer
+            action = parse_object(raw)
+            if action is None:  # prose, not JSON → treat it as the final answer
                 self.result.answer = raw.strip() or "(the model returned an empty response)"
                 return
 
@@ -180,14 +188,14 @@ class AgentRun:
             name = str(action.get("action", "")).strip()
             action_input = action.get("action_input", {})
 
-            if name.upper() == "FINAL" or name == "":
+            if name.upper() == "FINAL" or not name:
                 self.result.answer = _as_answer(action_input) or "(no answer produced)"
                 return
 
             if name not in self._by_name:
                 observation = {
                     "error": f"'{name}' is not an available tool. "
-                    f"Choose from: {', '.join(sorted(self._by_name))}."
+                             f"Choose from: {', '.join(sorted(self._by_name))}."
                 }
                 self._record(step_no, thought, name, _as_args(action_input),
                              observation, source="—", ok=False, status="error")
@@ -198,45 +206,67 @@ class AgentRun:
             self._emit({"type": "tool_start", "index": step_no, "tool": name,
                         "label": catalog.label_for(name), "tag": tool.tag, "args": args})
 
-            # Approval gate: pause the run and hand control back to the caller.
-            if tool.tag == "confirm":
+            # Approval gate. For browser actions this is decided from the live
+            # page: the same tool is safe on a search button and consequential on
+            # "Place order", so the verdict comes from the last observation.
+            level, why = catalog.risk(name, args, self._gates)
+            if level == catalog.CONFIRM:
                 pend = PendingApproval(
                     index=step_no, tool=name, args=args, thought=thought,
                     label=catalog.label_for(name),
-                    description=catalog.describe_action(name, args),
+                    description=why or catalog.describe_action(name, args),
                 )
-                # The terminal 'awaiting_approval' event (with a run_id for
-                # resuming) is emitted by the streaming layer, not here.
-                approved = yield pend
+                # The terminal 'awaiting_approval' event (carrying a run_id) is
+                # emitted by the streaming layer, not here.
+                decision = yield pend
+                approved, args = _decision(decision, args, _editable(tool))
                 if not approved:
-                    observation = {"status": "declined",
-                                   "message": "The user declined this action, so "
-                                              "it was not performed."}
-                    self._record(step_no, thought, name, args, observation,
-                                 source="—", ok=False, status="declined",
-                                 label=catalog.label_for(name),
-                                 summary="Declined by user")
+                    observation = {
+                        "status": "declined",
+                        "message": "The user declined this action, so it was not performed.",
+                    }
+                    self._record(step_no, thought, name, args, observation, source="—",
+                                 ok=False, status="declined",
+                                 label=catalog.label_for(name), summary="Declined")
                     self._emit({"type": "tool_end", "index": step_no, "tool": name,
-                                "ok": False, "status": "declined",
-                                "summary": "Declined by user"})
+                                "label": catalog.label_for(name), "args": args,
+                                "ok": False, "status": "declined", "summary": "Declined"})
                     continue
 
             tool_result = mgr.call_tool(name, args, self.context)
             observation = tool_result.content
+            # Refresh the approval gates from this observation, so the next
+            # proposed click is judged against the page as it is *now*.
+            if isinstance(observation, dict) and "gates" in observation:
+                self._gates = observation.get("gates") or {}
             status = "done" if tool_result.ok else "error"
             summary = catalog.summarize(name, observation)
             self._record(step_no, thought, name, args, observation,
                          source=tool_result.source, ok=tool_result.ok, status=status,
                          label=catalog.label_for(name), summary=summary)
-            self._emit({"type": "tool_end", "index": step_no, "tool": name,
-                        "ok": tool_result.ok, "status": status, "summary": summary})
+            # The event carries everything the run recorder and the live view need,
+            # so neither has to reach back into the observation.
+            event = {"type": "tool_end", "index": step_no, "tool": name,
+                     "label": catalog.label_for(name), "args": args,
+                     "ok": tool_result.ok, "status": status, "summary": summary}
+            if isinstance(observation, dict):
+                event["url"] = observation.get("url", "")
+                event["screenshot"] = observation.get("screenshot", "")
+                if observation.get("target"):
+                    event["target"] = observation["target"]
+                if observation.get("warnings"):
+                    event["warnings"] = observation["warnings"]
+                if observation.get("path"):          # file_write
+                    event["output"] = observation["path"]
+            self._emit(event)
 
-        # Hit the step cap without a FINAL — summarise what we have.
+        # Hit the step cap without a FINAL — say so honestly.
         last = self.result.steps[-1] if self.result.steps else None
         if last is not None:
             self.result.answer = (
-                "I reached the step limit before finishing. Here is the most recent "
-                f"tool result from `{last.tool}`:\n\n```json\n{_json(last.observation)}\n```"
+                f"I reached the {self.max_steps}-step limit before finishing. "
+                f"The last thing I did was `{last.tool}` — {last.summary}. "
+                "Tell me what to do next, or break the task into smaller steps."
             )
         else:
             self.result.answer = "I couldn't complete that within the step limit."
@@ -249,7 +279,6 @@ class AgentRun:
             Step(index, thought, tool, args, observation, source, ok,
                  label=label, summary=summary, tag=tag, status=status)
         )
-        self._transcript.append(_fmt_step(index, thought, tool, args, observation))
 
     def _emit(self, event: dict) -> None:
         if self.on_event:
@@ -260,90 +289,126 @@ class AgentRun:
 
 
 # --------------------------------------------------------------------------- #
-# Prompt building & parsing helpers                                           #
+# Prompt building                                                             #
 # --------------------------------------------------------------------------- #
 def _render_tools(tools: list[ToolInfo]) -> str:
-    lines = []
+    """Group tools by server so the model sees capabilities, not a flat list."""
+    order = ["browser", "workspace", "web", "briefs", "theta"]
+    groups: dict[str, list[str]] = {}
     for t in tools:
+        if t.name in catalog.HIDDEN_TOOLS:
+            continue
         props = (t.input_schema or {}).get("properties", {})
         required = set((t.input_schema or {}).get("required", []))
         params = []
         for pname, pinfo in props.items():
-            if pname in catalog.RESERVED_PARAMS:  # injected server-side; hide from LLM
+            if pname in catalog.RESERVED_PARAMS:  # injected server-side; hide it
                 continue
             typ = pinfo.get("type", "any")
             if pname in required:
                 params.append(f"{pname}: {typ}")
             else:
-                default = pinfo.get("default", None)
-                params.append(f"{pname}: {typ} = {json.dumps(default)}")
-        sig = ", ".join(params)
-        flag = "  ⚠️ requires approval" if t.tag == "confirm" else ""
-        lines.append(f"- {t.name}({sig}) — {t.description}{flag}")
+                params.append(f"{pname}: {typ} = {json.dumps(pinfo.get('default'))}")
+        flag = "  ⚠️ pauses for the user" if t.tag == "confirm" else ""
+        groups.setdefault(t.server, []).append(
+            f"- {t.name}({', '.join(params)}) — {t.description}{flag}"
+        )
+
+    lines = []
+    for server in order + [s for s in groups if s not in order]:
+        if server in groups:
+            lines.append(f"[{server}]")
+            lines += groups[server]
     return "\n".join(lines)
 
 
-def _build_user_prompt(command: str, tools_desc: str, transcript: list[str]) -> str:
-    work = "\n".join(transcript) if transcript else "(none yet)"
-    return (
-        f"USER COMMAND:\n{command}\n\n"
-        f"AVAILABLE TOOLS:\n{tools_desc}\n\n"
-        f"WORK SO FAR:\n{work}\n\n"
-        "Now produce the next JSON object."
+def _build_user_prompt(
+    command: str, tools_desc: str, steps: list[Step], history: list[dict]
+) -> str:
+    parts = []
+    if history:
+        turns = "\n".join(
+            f"{h.get('role', 'user')}: {_truncate(str(h.get('content', '')), 600)}"
+            for h in history
+        )
+        parts.append(f"CONVERSATION SO FAR:\n{turns}")
+    parts.append(f"GOAL:\n{command}")
+    parts.append(f"AVAILABLE TOOLS:\n{tools_desc}")
+    parts.append("WORK SO FAR:\n" + (_render_steps(steps) if steps else "(nothing yet)"))
+    parts.append(
+        "Now produce the next JSON object. Use only refs from the CURRENT PAGE above."
     )
+    return "\n\n".join(parts)
 
 
-def _fmt_step(idx: int, thought: str, tool: str, args, observation) -> str:
-    return (
-        f"Step {idx} — thought: {thought}\n"
-        f"  action: {tool} {json.dumps(_as_args(args))}\n"
-        f"  observation: {_truncate(_json(observation), 1200)}"
+def _render_steps(steps: list[Step]) -> str:
+    """Replay the run for the model, keeping only the *latest* page in full.
+
+    A page observation is a few thousand tokens. Carrying every one of them
+    through a twenty-step browser task would blow the context window and cost a
+    fortune, and stale element refs actively mislead the model — they are
+    renumbered after every action. So history collapses to what was done and
+    what came of it, and only the current page is described in full.
+    """
+    lines: list[str] = []
+    for step in steps[:-1]:
+        lines.append(
+            f"Step {step.index}: {step.tool}"
+            f"{_compact_args(step.args)} → {step.summary or ('ok' if step.ok else 'failed')}"
+        )
+
+    last = steps[-1]
+    lines.append(
+        f"Step {last.index}: {last.tool}{_compact_args(last.args)}"
+        f" → {last.summary or ('ok' if last.ok else 'failed')}"
     )
+    observation = last.observation
+    if isinstance(observation, dict) and observation.get("page"):
+        detail = {k: v for k, v in observation.items()
+                  if k not in ("page", "gates", "target", "screenshot")}
+        if detail:
+            lines.append(_truncate(_json(detail), 900))
+        lines.append("\nCURRENT PAGE:\n" + str(observation["page"]))
+    else:
+        lines.append(_truncate(_json(observation), 3000))
+    return "\n".join(lines)
 
 
-def _parse_action(text: str) -> dict | None:
-    """Extract the first JSON object from the model's reply, tolerating code
-    fences and surrounding prose."""
-    if not text:
-        return None
-    cleaned = text.strip()
-    # Strip ```json ... ``` fences if present.
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-    cleaned = cleaned.strip()
-
-    obj = _try_json_variants(cleaned)
-    if obj is not None:
-        return obj
-
-    # Fallback: grab the outermost {...} and retry the same variants on it.
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        snippet = cleaned[start : end + 1]
-        return _try_json_variants(snippet)
-    return None
+def _compact_args(args) -> str:
+    args = _as_args(args)
+    shown = {k: v for k, v in args.items() if k not in catalog.RESERVED_PARAMS}
+    if not shown:
+        return ""
+    return "(" + ", ".join(f"{k}={_truncate(str(v), 60)!r}" for k, v in shown.items()) + ")"
 
 
-def _try_json_variants(snippet: str) -> dict | None:
-    """Try parsing as-is, then with escaped quotes/newlines unescaped — some
-    models wrap their JSON action in an extra layer of string-escaping."""
-    for candidate in (snippet, snippet.replace('\\"', '"').replace("\\n", "\n")):
-        try:
-            obj = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
+def _editable(tool: ToolInfo) -> set[str]:
+    """Parameters an approver may rewrite: everything the tool declares except
+    the reserved ones the manager injects."""
+    props = (tool.input_schema or {}).get("properties", {})
+    return set(props) - catalog.RESERVED_PARAMS
+
+
+def _decision(decision, args: dict, allowed: set[str]) -> tuple[bool, dict]:
+    """Interpret what came back through the generator at an approval point.
+
+    A bare bool is the simple yes/no. A dict may also carry replacement `args`,
+    which is how an edited research plan gets back into the run. Edits are
+    restricted to parameters the tool actually declares (minus the reserved ones
+    injected server-side), so approving can never smuggle in an argument the tool
+    was not designed to take.
+    """
+    if not isinstance(decision, dict):
+        return bool(decision), args
+    approved = bool(decision.get("approved"))
+    edited = decision.get("args")
+    if approved and isinstance(edited, dict):
+        args = {**args, **{k: v for k, v in edited.items() if k in allowed}}
+    return approved, args
 
 
 def _as_args(action_input) -> dict:
-    if isinstance(action_input, dict):
-        return action_input
-    return {}
+    return action_input if isinstance(action_input, dict) else {}
 
 
 def _as_answer(action_input) -> str:

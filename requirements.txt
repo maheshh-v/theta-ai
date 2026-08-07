@@ -1,13 +1,20 @@
 # Theta — runtime dependencies. Python 3.10+ (developed and verified on 3.12).
 
-mcp>=1.2.0             # Model Context Protocol SDK (tool servers + client)
-fastapi>=0.110         # Web framework (chat API, OAuth, static SPA)
-uvicorn[standard]>=0.27  # ASGI server
-requests>=2.31         # REST calls to Gemini / Ollama and the Google APIs
-python-dotenv>=1.0     # Load configuration from a local .env
-cryptography>=42.0     # Encrypts stored OAuth tokens and API keys at rest
+playwright>=1.40          # drives the real Chromium browser (the core capability)
+mcp>=1.2.0                # Model Context Protocol SDK (tool servers + client)
+fastapi>=0.110            # Web framework (run API, playbooks, static SPA)
+uvicorn[standard]>=0.27   # ASGI server
+requests>=2.31            # REST calls to the model providers and search
+python-dotenv>=1.0        # Load configuration from a local .env
+cryptography>=42.0        # Encrypts stored API keys at rest
+trafilatura>=1.8          # Readable-text extraction (used by the research tool)
+pypdf>=4.0                # Text extraction from PDF sources
 
+# After installing, download the browser binary once:
+#     python -m playwright install chromium
+#
 # Notes:
-# - No LLM SDK and no Google SDK: Gemini, Ollama, Gmail and Calendar are all
-#   called over plain REST with `requests`.
-# - Dev/test extras (pytest, httpx) live in requirements-dev.txt.
+# - No LLM SDK and no agent framework: Gemini, Ollama and OpenAI-compatible
+#   endpoints are all plain REST, and the agent loop is ~350 lines of our own.
+# - Dev/test extras (pytest, httpx) live in requirements-dev.txt. The test suite
+#   never launches a browser — it runs against a fake page model.

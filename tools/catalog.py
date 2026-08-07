@@ -1,47 +1,100 @@
 """
-Central tool metadata — the single source of truth the rest of the app reads,
-regardless of whether a tool arrives via live MCP discovery or the in-process
-fallback.
+Tool metadata and — more importantly — **when Theta must stop and ask**.
 
-* `AUTH_SERVERS`   — servers whose tools need a Google access token (injected by
-                     the manager at call time, never chosen by the LLM).
-* `RESERVED_PARAMS`— parameters hidden from the LLM and injected server-side.
-* `CONFIRM_TOOLS`  — tools that require explicit human approval before running
-                     (they send mail or change a real calendar).
-* `ACTION_LABELS`  — short human verbs for the execution trace.
-* helpers          — `describe_action` (approval card) and `summarize` (trace).
+The approval gate here is dynamic, which is the whole point. A static list of
+"dangerous tools" is useless for a browser agent: `browser_click` is harmless on
+a search button and irreversible on "Place order". So the browser layer
+classifies each *control* as it observes the page (`browser/guard.py`) and ships
+the verdict back with the observation as `gates`. This module reads those gates
+to decide whether the next proposed action needs a human.
+
+Approval is reserved for actions that change the world — submitting, paying,
+deleting, sending — plus deep research, which is gated because it is slow and
+worth steering rather than because it is dangerous.
 """
 
 from __future__ import annotations
 
-AUTH_SERVERS = {"gmail", "calendar"}
-RESERVED_PARAMS = {"access_token"}
-CONFIRM_TOOLS = {"gmail_send_reply", "calendar_add", "calendar_update"}
+SAFE = "safe"
+CONFIRM = "confirm"
+
+# Injected server-side and hidden from the model: the screenshot destination and
+# the search credentials. The model neither sees nor chooses these.
+RESERVED_PARAMS = {"shot_path", "search_provider", "search_api_key"}
+
+# Tools gated regardless of arguments.
+ALWAYS_CONFIRM = {"research"}
+
+# Tools whose risk depends on which element they touch.
+GATED_BY_ELEMENT = {"browser_click", "browser_type", "browser_select"}
+
+SEARCH_SERVERS = {"web"}
+BROWSER_SERVERS = {"browser"}
+
+# Tools that exist for Playbook replay, not for the agent to choose. They are
+# still real MCP tools — they are simply left out of the list the model sees.
+HIDDEN_TOOLS = {"browser_step"}
 
 ACTION_LABELS = {
-    "gmail_list": "Reading Gmail",
-    "gmail_search": "Searching Gmail",
-    "gmail_read": "Opening email",
-    "gmail_draft_reply": "Drafting reply",
-    "gmail_send_reply": "Sending reply",
-    "calendar_list": "Checking calendar",
-    "calendar_add": "Adding event",
-    "calendar_update": "Updating event",
-    "tasks_list": "Reading tasks",
-    "tasks_add": "Adding task",
-    "tasks_complete": "Completing task",
-    "notes_list": "Reading notes",
-    "notes_add": "Saving note",
-    "notes_search": "Searching notes",
+    "browser_navigate": "Opening page",
+    "browser_snapshot": "Looking at the page",
+    "browser_click": "Clicking",
+    "browser_type": "Typing",
+    "browser_select": "Choosing",
+    "browser_scroll": "Scrolling",
+    "browser_back": "Going back",
+    "browser_wait_for": "Waiting",
+    "browser_read": "Reading the page",
+    "browser_reset": "Resetting the browser",
+    "file_write": "Saving file",
+    "file_read": "Reading file",
+    "file_list": "Listing files",
+    "web_search": "Searching the web",
+    "web_read": "Reading a page",
+    "research": "Researching",
+    "brief_list": "Searching past research",
+    "brief_read": "Opening a brief",
 }
 
 
 def tag_for(name: str) -> str:
-    return "confirm" if name in CONFIRM_TOOLS else "read"
+    """Static tag, used for display and for the tool list the model sees. Element
+    gating is decided per call by `risk()`."""
+    if name in ALWAYS_CONFIRM:
+        return "confirm"
+    if name in GATED_BY_ELEMENT:
+        return "maybe"
+    return "read"
 
 
-def needs_auth(server: str | None) -> bool:
-    return server in AUTH_SERVERS
+def needs_search_config(server: str | None) -> bool:
+    return server in SEARCH_SERVERS
+
+
+def needs_screenshot(server: str | None) -> bool:
+    return server in BROWSER_SERVERS
+
+
+def risk(name: str, args: dict, gates: dict | None = None) -> tuple[str, str]:
+    """Decide whether this specific call needs human approval.
+
+    `gates` maps element ref -> why it is consequential, as reported by the most
+    recent page observation.
+    """
+    args = args or {}
+    if name in ALWAYS_CONFIRM:
+        return CONFIRM, describe_action(name, args)
+
+    if name in GATED_BY_ELEMENT:
+        # Typing then pressing Enter submits a form even when the field itself
+        # is innocuous, so it is gated on the action rather than the element.
+        if name == "browser_type" and args.get("submit"):
+            return CONFIRM, "Submit the form after typing"
+        ref = str(args.get("ref", ""))
+        reason = (gates or {}).get(ref)
+        if reason:
+            return CONFIRM, reason[:1].upper() + reason[1:]
+    return SAFE, ""
 
 
 def label_for(name: str) -> str:
@@ -49,56 +102,65 @@ def label_for(name: str) -> str:
 
 
 def describe_action(name: str, args: dict) -> str:
-    """One-line, human-readable description of a pending action for the approval
-    card. Uses only the arguments (no network calls)."""
+    """Human-readable description of a pending action for the approval card."""
     a = args or {}
-    if name == "gmail_send_reply":
-        preview = (a.get("body") or "").strip().replace("\n", " ")
-        if len(preview) > 140:
-            preview = preview[:140] + "…"
-        return f"Send this reply:\n\n“{preview}”"
-    if name == "calendar_add":
-        when = a.get("date", "")
-        if a.get("time"):
-            when += f" {a['time']}"
-        return f"Add “{a.get('title', 'event')}” to your calendar on {when}."
-    if name == "calendar_update":
-        return f"Update calendar event {a.get('event_id', '')}."
+    if name == "research":
+        plan = [str(q).strip() for q in (a.get("subquestions") or []) if str(q).strip()]
+        lines = [f"Research: “{a.get('question', '')}”"]
+        if plan:
+            lines += ["", "Plan:"] + [f"{i}. {q}" for i, q in enumerate(plan, 1)]
+        else:
+            lines += ["", "Theta will plan the sub-questions itself."]
+        return "\n".join(lines)
+    if name == "browser_click":
+        return f"Click element [{a.get('ref')}] on the page."
+    if name == "browser_type":
+        return f'Type “{_trim(a.get("text", ""), 80)}” into element [{a.get("ref")}] and submit.'
     return f"Run {label_for(name)}."
 
 
 def summarize(name: str, result) -> str:
-    """Short status line for the trace, e.g. 'Found 3 emails'."""
-    if isinstance(result, dict) and result.get("error"):
-        msg = result.get("message") or result.get("error")
-        return f"⚠️ {msg}"
-    n = len(result) if isinstance(result, list) else None
-
-    if name in ("gmail_list", "gmail_search"):
-        return f"Found {n} email{'s' if n != 1 else ''}" if n is not None else "Searched Gmail"
-    if name == "gmail_read":
-        subj = result.get("subject", "") if isinstance(result, dict) else ""
-        return f"Read “{subj}”" if subj else "Read email"
-    if name == "gmail_draft_reply":
-        return "Draft saved"
-    if name == "gmail_send_reply":
-        return "Reply sent"
-    if name == "calendar_list":
-        return f"{n} event{'s' if n != 1 else ''}" if n is not None else "Checked calendar"
-    if name == "calendar_add":
-        return "Event created"
-    if name == "calendar_update":
-        return "Event updated"
-    if name == "tasks_list":
-        return f"{n} task{'s' if n != 1 else ''}" if n is not None else "Read tasks"
-    if name == "tasks_add":
-        return "Task added"
-    if name == "tasks_complete":
-        return "Task completed"
-    if name == "notes_list":
-        return f"{n} note{'s' if n != 1 else ''}" if n is not None else "Read notes"
-    if name == "notes_add":
-        return "Note saved"
-    if name == "notes_search":
-        return f"{n} match{'es' if n != 1 else ''}" if n is not None else "Searched notes"
+    """Short status line for the execution trace."""
+    if isinstance(result, dict):
+        if result.get("error"):
+            return f"⚠️ {_trim(result.get('message') or result.get('error'), 90)}"
+        if name.startswith("browser_"):
+            message = result.get("message") or ""
+            title = result.get("title") or ""
+            if name == "browser_read":
+                return f"Read {result.get('chars', 0):,} characters"
+            if name in ("browser_navigate", "browser_back") and title:
+                return f"{message} — “{_trim(title, 46)}”" if message else _trim(title, 60)
+            return _trim(message, 70) or "Done"
+        if name == "file_write":
+            return f"Saved {result.get('path', '')} ({result.get('bytes', 0):,} bytes)"
+        if name == "file_read":
+            return f"Read {result.get('path', '')}"
+        if name == "file_list":
+            return _plural(result.get("count"), "file")
+        if name == "research":
+            title, cited = result.get("title"), result.get("sources_cited")
+            if title:
+                return f"“{_trim(title, 42)}” · {_plural(cited, 'source')}"
+            return "Brief written"
+        if name == "brief_read":
+            return f"Opened “{_trim(result.get('title', ''), 44)}”"
+        if name in ("web_search", "brief_list"):
+            word = "result" if name == "web_search" else "brief"
+            return _plural(result.get("count"), word)
+        if name == "web_read":
+            return f"Read “{_trim(result.get('title', ''), 44)}”"
+    if isinstance(result, list):
+        return _plural(len(result), "item")
     return "Done"
+
+
+def _plural(n, word: str) -> str:
+    if n is None:
+        return word.capitalize()
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
+def _trim(text, n: int) -> str:
+    text = str(text or "")
+    return text if len(text) <= n else text[: n - 1] + "…"

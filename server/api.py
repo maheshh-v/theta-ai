@@ -1,150 +1,109 @@
 """
 HTTP API for Theta (FastAPI router, mounted at /api).
 
-Sections: health/session, Google OAuth (login/callback/disconnect), and
-connected accounts. Later phases add chat (SSE), settings, and tools.
+Five groups: status, do (streaming agent runs + approvals), playbooks (saved
+automations), runs (the audit trail), and settings. No accounts and no OAuth —
+Theta needs nothing but a model key.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import secrets
-from urllib.parse import quote
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from config import settings
-from integrations.google import oauth
-from server import accounts, chat, llm_settings
+from agent.llm import LLMError
+from automation.playbooks import from_run, playbooks
+from automation.runs import runs
+from research.briefs import store as briefs
+from research.render import to_markdown
+from server import chat, preferences
 from server.session import current_session
 from tools import catalog
 
 router = APIRouter()
 _log = logging.getLogger("theta.api")
 
-_GOOGLE_SETUP_HINT = (
-    "Google isn't configured on this server. Set GOOGLE_CLIENT_ID and "
-    "GOOGLE_CLIENT_SECRET (see README) to enable connecting Gmail and Calendar."
-)
-
 
 # --------------------------------------------------------------------------- #
-# Health / session                                                            #
+# Status                                                                      #
 # --------------------------------------------------------------------------- #
 @router.get("/health")
 def health() -> dict:
     return {"status": "ok", "app": "theta"}
 
 
-@router.get("/session")
-def session_info(request: Request) -> dict:
-    s = current_session(request)
+@router.get("/status")
+def status(request: Request) -> dict:
+    """Everything the UI needs to decide whether Theta is ready to work."""
+    session = current_session(request)
+    mgr = request.app.state.mcp
+    config = preferences.public_config(session)
     return {
-        "session": s.sid[:8],
-        "keys": sorted(s.data.keys()),
-        "google_configured": settings.google_configured,
+        "ready": config["model_ready"],
+        "model": config["active_label"],
+        "model_ready": config["model_ready"],
+        "model_error": config["model_error"],
+        "search": config["search_label"],
+        "transport": mgr.transport,
+        "tool_count": len([t for t in mgr.list_tools() if t.name not in catalog.HIDDEN_TOOLS]),
+        "playbooks": len(playbooks.list()),
+        "runs": len(runs.list(limit=200)),
+        "headless": config["browser_headless"],
     }
 
 
+@router.get("/tools")
+def tools_list(request: Request) -> dict:
+    mgr = request.app.state.mcp
+    tools = [
+        {
+            "name": t.name,
+            "server": t.server,
+            "description": t.description,
+            "tag": t.tag,
+            "params": [
+                p for p in (t.input_schema or {}).get("properties", {})
+                if p not in catalog.RESERVED_PARAMS
+            ],
+        }
+        for t in mgr.list_tools()
+        if t.name not in catalog.HIDDEN_TOOLS
+    ]
+    return {"transport": mgr.transport, "count": len(tools), "tools": tools}
+
+
 # --------------------------------------------------------------------------- #
-# Google OAuth                                                                 #
+# Do — streaming agent runs                                                   #
 # --------------------------------------------------------------------------- #
-@router.get("/auth/google/login")
-def google_login(request: Request):
-    if not settings.google_configured:
-        return JSONResponse(
-            {"error": "google_not_configured", "message": _GOOGLE_SETUP_HINT},
-            status_code=400,
-        )
-    s = current_session(request)
-    state = secrets.token_urlsafe(24)
-    s.set("oauth_state", state)
-    return RedirectResponse(oauth.build_auth_url(state), status_code=302)
+@router.post("/do")
+async def do_start(request: Request):
+    data = await _json_body(request)
+    goal = (data.get("goal") or data.get("message") or "").strip()
+    session = current_session(request)
+    if not goal:
+        return chat.error_stream("Tell me what you'd like done.")
 
-
-@router.get("/auth/google/callback")
-def google_callback(
-    request: Request,
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-):
-    s = current_session(request)
-    expected = s.pop("oauth_state", None)
-
-    def back(**params) -> RedirectResponse:
-        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-        return RedirectResponse(f"/?tab=accounts&{query}", status_code=302)
-
-    if error:
-        return back(error=error)
-    if not code or not state or state != expected:
-        return back(error="state_mismatch")
     try:
-        token = oauth.exchange_code(code)
-    except oauth.GoogleAuthError as ex:
-        _log.warning("Google OAuth exchange failed: %s", ex)
-        return back(error="exchange_failed")
+        agent, ctx = chat.make_agent(request.app, session)
+    except LLMError as ex:
+        return chat.no_model_stream(ex)
 
-    s.set(accounts.GOOGLE_KEY, token)
-    _log.info("Connected Google account for %s", token.get("email") or "(unknown)")
-    return back(connected="google")
+    record = runs.create(goal=goal, model=agent.llm.label)
+    ctx.shot_path_factory = chat.shot_factory(record.id)
 
-
-@router.post("/auth/google/disconnect")
-def google_disconnect(request: Request) -> dict:
-    accounts.disconnect(current_session(request))
-    return {"status": "disconnected"}
-
-
-# --------------------------------------------------------------------------- #
-# Connected accounts                                                          #
-# --------------------------------------------------------------------------- #
-@router.get("/accounts")
-def accounts_status(request: Request) -> dict:
-    return accounts.status(current_session(request))
-
-
-# --------------------------------------------------------------------------- #
-# LLM settings                                                                #
-# --------------------------------------------------------------------------- #
-@router.get("/settings")
-def get_settings(request: Request) -> dict:
-    return llm_settings.public_config(current_session(request))
-
-
-@router.post("/settings")
-async def post_settings(request: Request) -> dict:
-    data = await _json_body(request)
-    session = current_session(request)
-    llm_settings.update(session, data)
-    return llm_settings.public_config(session)
-
-
-@router.post("/settings/test")
-async def test_settings(request: Request) -> dict:
-    data = await _json_body(request)
-    ok, message = llm_settings.test(current_session(request), data)
-    return {"ok": ok, "message": message}
-
-
-# --------------------------------------------------------------------------- #
-# Chat (streaming) + approvals                                                #
-# --------------------------------------------------------------------------- #
-@router.post("/chat")
-async def chat_start(request: Request):
-    data = await _json_body(request)
-    message = (data.get("message") or "").strip()
-    session = current_session(request)
-    agent, ctx = chat.make_agent(request.app, session)
-    run = agent.start(message, ctx)
+    turns = chat.history(session)
+    chat.remember(session, "user", goal)
+    run = agent.start(goal, ctx, history=turns)
+    run.record_id = record.id
     run_id = request.app.state.runs.add(session.sid, run)
     return chat.stream_run(request.app, session, run, run_id, approved=None)
 
 
-@router.post("/chat/resume")
-async def chat_resume(request: Request):
+@router.post("/do/resume")
+async def do_resume(request: Request):
     data = await _json_body(request)
     run_id = data.get("run_id") or ""
     approved = bool(data.get("approved"))
@@ -152,29 +111,205 @@ async def chat_resume(request: Request):
     run = request.app.state.runs.get(run_id, session.sid)
     if run is None:
         return JSONResponse({"error": "unknown_or_expired_run"}, status_code=404)
-    return chat.stream_run(request.app, session, run, run_id, approved=approved)
+    edited = data.get("args")
+    return chat.stream_run(
+        request.app, session, run, run_id, approved=approved,
+        args=edited if isinstance(edited, dict) else None,
+    )
+
+
+@router.post("/do/clear")
+def do_clear(request: Request) -> dict:
+    chat.clear_history(current_session(request))
+    return {"status": "cleared"}
 
 
 # --------------------------------------------------------------------------- #
-# Tools catalogue                                                             #
+# Playbooks                                                                   #
 # --------------------------------------------------------------------------- #
-@router.get("/tools")
-def tools_list(request: Request) -> dict:
-    mgr = request.app.state.mcp
-    tools = []
-    for t in mgr.list_tools():
-        params = [
-            p for p in (t.input_schema or {}).get("properties", {})
-            if p not in catalog.RESERVED_PARAMS
-        ]
-        tools.append({
-            "name": t.name,
-            "server": t.server,
-            "description": t.description,
-            "tag": t.tag,
-            "params": params,
-        })
-    return {"transport": mgr.transport, "count": len(tools), "tools": tools}
+@router.get("/playbooks")
+def playbooks_index() -> dict:
+    items = playbooks.list()
+    return {"count": len(items), "playbooks": [p.summary_dict() for p in items]}
+
+
+@router.get("/playbooks/{pid}")
+def playbook_detail(pid: str):
+    pb = playbooks.get(pid)
+    if pb is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    data = pb.to_dict()
+    data["step_descriptions"] = [s.describe() for s in pb.steps]
+    return data
+
+
+@router.post("/playbooks")
+async def playbook_create(request: Request):
+    """Distil a completed run into a reusable automation."""
+    data = await _json_body(request)
+    record = runs.get(str(data.get("run_id", "")))
+    if record is None:
+        return JSONResponse({"error": "run_not_found"}, status_code=404)
+
+    pb = from_run(record, name=str(data.get("name", "")),
+                  description=str(data.get("description", "")))
+    if not pb.steps:
+        return JSONResponse(
+            {"error": "nothing_to_save",
+             "message": "That run had no repeatable actions to turn into a playbook."},
+            status_code=400,
+        )
+    playbooks.save(pb)
+    return pb.summary_dict()
+
+
+@router.post("/playbooks/{pid}/run")
+async def playbook_run(pid: str, request: Request):
+    pb = playbooks.get(pid)
+    if pb is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    data = await _json_body(request)
+    values = data.get("values") if isinstance(data.get("values"), dict) else {}
+    return chat.stream_replay(request.app, current_session(request), pb, values or {})
+
+
+@router.patch("/playbooks/{pid}")
+async def playbook_update(pid: str, request: Request):
+    pb = playbooks.get(pid)
+    if pb is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    data = await _json_body(request)
+    if data.get("name"):
+        pb.name = str(data["name"])[:120]
+    if data.get("description") is not None:
+        pb.description = str(data["description"])[:600]
+    playbooks.save(pb)
+    return pb.summary_dict()
+
+
+@router.delete("/playbooks/{pid}")
+def playbook_delete(pid: str):
+    if not playbooks.delete(pid):
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return {"status": "deleted"}
+
+
+# --------------------------------------------------------------------------- #
+# Runs — the audit trail                                                      #
+# --------------------------------------------------------------------------- #
+@router.get("/runs")
+def runs_index(limit: int = 40) -> dict:
+    items = runs.list(limit=max(1, min(limit, 200)))
+    return {"count": len(items), "runs": [r.summary_dict() for r in items]}
+
+
+@router.get("/runs/{run_id}")
+def run_detail(run_id: str):
+    record = runs.get(run_id)
+    if record is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return record.to_dict()
+
+
+@router.get("/runs/{run_id}/shot/{name}")
+def run_screenshot(run_id: str, name: str):
+    path = runs.screenshot(run_id, name)
+    if path is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return FileResponse(str(path), media_type="image/jpeg")
+
+
+@router.delete("/runs/{run_id}")
+def run_delete(run_id: str):
+    if not runs.delete(run_id):
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return {"status": "deleted"}
+
+
+# --------------------------------------------------------------------------- #
+# Workspace files                                                             #
+# --------------------------------------------------------------------------- #
+@router.get("/files")
+def files_index() -> dict:
+    from tools import workspace_tools
+
+    return workspace_tools.file_list()
+
+
+@router.get("/files/{name:path}")
+def file_download(name: str):
+    from tools.workspace_tools import WorkspaceError, _resolve
+
+    try:
+        path = _resolve(name)
+    except WorkspaceError as ex:
+        return JSONResponse({"error": "refused", "message": str(ex)}, status_code=400)
+    if not path.exists():
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return FileResponse(str(path), filename=path.name,
+                        media_type="text/plain; charset=utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Briefs (optional research capability)                                       #
+# --------------------------------------------------------------------------- #
+@router.get("/briefs")
+def briefs_index(q: str = "", limit: int = 50) -> dict:
+    items = briefs.list(query=q, limit=max(1, min(limit, 200)))
+    return {"count": len(items), "briefs": [b.summary_dict() for b in items]}
+
+
+@router.get("/briefs/{brief_id}")
+def brief_detail(brief_id: str):
+    brief = briefs.get(brief_id)
+    if brief is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return brief.to_dict()
+
+
+@router.get("/briefs/{brief_id}/markdown")
+def brief_markdown(brief_id: str):
+    brief = briefs.get(brief_id)
+    if brief is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return PlainTextResponse(to_markdown(brief), media_type="text/markdown")
+
+
+@router.delete("/briefs/{brief_id}")
+def brief_delete(brief_id: str):
+    if not briefs.delete(brief_id):
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return {"status": "deleted"}
+
+
+# --------------------------------------------------------------------------- #
+# Settings                                                                    #
+# --------------------------------------------------------------------------- #
+@router.get("/settings")
+def get_settings(request: Request) -> dict:
+    return preferences.public_config(current_session(request))
+
+
+@router.post("/settings")
+async def post_settings(request: Request) -> dict:
+    data = await _json_body(request)
+    session = current_session(request)
+    preferences.update(session, data)
+    return preferences.public_config(session)
+
+
+@router.post("/settings/test")
+async def test_model(request: Request) -> dict:
+    data = await _json_body(request)
+    ok, message = preferences.test_model(current_session(request), data)
+    return {"ok": ok, "message": message}
+
+
+@router.post("/settings/test-search")
+async def test_search(request: Request) -> dict:
+    data = await _json_body(request)
+    ok, message = preferences.test_search(current_session(request), data)
+    return {"ok": ok, "message": message}
 
 
 async def _json_body(request: Request) -> dict:
@@ -182,8 +317,7 @@ async def _json_body(request: Request) -> dict:
         body = await request.body()
         if not body:
             return {}
-        import json
         parsed = json.loads(body)
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return {}

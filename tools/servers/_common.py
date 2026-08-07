@@ -2,10 +2,13 @@
 Small compatibility shim so each MCP server file works across SDK versions.
 
 The MCP Python SDK renamed the high-level server class from `FastMCP`
-(mcp < 2.0) to `MCPServer` (mcp >= 2.0). Both expose the same ergonomics we
-rely on: a `.tool()` decorator and `.run(transport="stdio")`. This helper hides
-the difference, and also puts the project root on sys.path so the servers can
-`import tools.backends` when launched as standalone scripts.
+(mcp < 2.0) to `MCPServer` (mcp >= 2.0). Both expose the same ergonomics we rely
+on: a `.tool()` decorator and `.run(transport="stdio")`. This helper hides the
+difference.
+
+Each server script puts the project root on sys.path itself, before importing
+this module (e.g. `python tools/servers/browser_server.py`) — doing it here would
+already be too late.
 """
 
 from __future__ import annotations

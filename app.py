@@ -1,7 +1,7 @@
 """
 Entry point for Theta.
 
-Builds the FastAPI app (chat API + OAuth + static SPA) and serves it with
+Builds the FastAPI app (chat API + brief library + static SPA) and serves it with
 uvicorn. ASGI servers can also import the module-level `app` object directly.
 
 Run locally:

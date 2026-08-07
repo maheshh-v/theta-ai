@@ -3,63 +3,96 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Theta — your personal AI agent</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%236d5efc'/%3E%3Ctext x='50' y='72' font-size='64' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3E%CE%B8%3C/text%3E%3C/svg%3E" />
+  <title>Theta — an agent that operates your browser</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%236d5efc'/%3E%3Ctext x='50' y='73' font-size='66' font-family='Georgia,serif' fill='white' text-anchor='middle'%3E%CE%B8%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div id="app">
     <aside class="sidebar">
-      <div class="brand"><span class="glyph">θ</span> Theta</div>
+      <div class="brand"><span class="glyph">θ</span> <span>Theta</span></div>
+
       <nav class="nav" id="nav">
-        <button class="nav-item active" data-view="chat"><span class="ic">💬</span> Chat</button>
-        <button class="nav-item" data-view="accounts"><span class="ic">🔗</span> Accounts
-          <span class="nav-badge" id="acctBadge" hidden></span></button>
-        <button class="nav-item" data-view="settings"><span class="ic">⚙️</span> Settings</button>
-        <button class="nav-item" data-view="activity"><span class="ic">📊</span> Activity
-          <span class="nav-badge" id="actBadge" hidden></span></button>
+        <button class="nav-item active" data-view="do"><span class="ic">▶</span> Do</button>
+        <button class="nav-item" data-view="playbooks"><span class="ic">⧉</span> Playbooks
+          <span class="nav-badge" id="pbBadge" hidden></span></button>
+        <button class="nav-item" data-view="history"><span class="ic">◷</span> History
+          <span class="nav-badge" id="runBadge" hidden></span></button>
+        <button class="nav-item" data-view="settings"><span class="ic">⚙</span> Settings</button>
       </nav>
+
+      <button class="new-btn" id="newTaskBtn">＋ New task</button>
+
       <div class="sidebar-spacer"></div>
       <div class="sidebar-foot">
-        <div class="status-line"><span class="dot" id="mcpDot"></span><span id="mcpText">connecting…</span></div>
-        <button class="theme-toggle" id="themeToggle"><span class="ic" id="themeIcon">🌙</span><span id="themeLabel">Dark</span></button>
+        <div class="status-line" id="statusLine">
+          <span class="dot" id="statusDot"></span><span id="statusText">starting…</span>
+        </div>
+        <button class="theme-toggle" id="themeToggle">
+          <span class="ic" id="themeIcon">🌙</span><span id="themeLabel">Dark</span>
+        </button>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
         <div>
-          <h1 id="viewTitle">Chat</h1>
-          <div class="sub" id="viewSub">Ask Theta to act across your Gmail and Calendar.</div>
+          <h1 id="viewTitle">Do</h1>
+          <div class="sub" id="viewSub">Give Theta a goal on the web and watch it work.</div>
         </div>
         <div class="topbar-right" id="topbarRight"></div>
       </header>
 
-      <!-- Chat -->
-      <section id="view-chat" class="view">
-        <div class="chat-scroll" id="chatScroll">
-          <div class="chat-inner" id="chatInner"></div>
+      <!-- Do -->
+      <section id="view-do" class="view">
+        <div class="do-split">
+          <div class="chat-scroll" id="chatScroll">
+            <div class="chat-inner" id="chatInner"></div>
+          </div>
+          <aside class="live-rail" id="liveRail" hidden>
+            <div class="live-head">
+              <span class="live-dot" id="liveDot"></span>
+              <span class="live-title">Live browser</span>
+              <span class="live-step" id="liveStep"></span>
+            </div>
+            <div class="live-url" id="liveUrl">about:blank</div>
+            <div class="live-shot" id="liveShot">
+              <div class="live-empty">The browser view appears here once Theta opens a page.</div>
+            </div>
+            <div class="live-note" id="liveNote"></div>
+          </aside>
         </div>
+
         <div class="composer-wrap">
           <div class="composer">
-            <textarea id="composerInput" rows="1" placeholder="Message Theta…  (e.g. “Do I have any unread emails?”)"></textarea>
-            <button class="btn primary" id="sendBtn">Send</button>
+            <textarea id="composerInput" rows="1"
+              placeholder="What should Theta do on the web?"></textarea>
+            <button class="btn primary" id="sendBtn">Run</button>
           </div>
-          <div class="hint">Theta acts on your real accounts. Sending mail and calendar changes always ask first.</div>
+          <div class="hint" id="composerHint">
+            Theta asks before anything irreversible, and never types a password.
+          </div>
         </div>
       </section>
 
-      <!-- Accounts -->
-      <section id="view-accounts" class="view hidden"><div class="wrap" id="accountsWrap"></div></section>
+      <!-- Playbooks -->
+      <section id="view-playbooks" class="view hidden">
+        <div class="wrap" id="playbooksWrap"></div>
+      </section>
+
+      <!-- History -->
+      <section id="view-history" class="view hidden">
+        <div class="wrap" id="historyWrap"></div>
+      </section>
 
       <!-- Settings -->
-      <section id="view-settings" class="view hidden"><div class="wrap" id="settingsWrap"></div></section>
-
-      <!-- Activity -->
-      <section id="view-activity" class="view hidden"><div class="wrap" id="activityWrap"></div></section>
+      <section id="view-settings" class="view hidden">
+        <div class="wrap" id="settingsWrap"></div>
+      </section>
     </main>
   </div>
 
+  <div id="modal" class="modal" hidden><div class="modal-card" id="modalCard"></div></div>
   <div id="toast"></div>
   <script src="/static/app.js"></script>
 </body>
