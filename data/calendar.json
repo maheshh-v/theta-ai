@@ -1,0 +1,54 @@
+{
+  "events": [
+    {
+      "id": "ev1",
+      "title": "Q3 roadmap review",
+      "date": "2026-08-07",
+      "time": "14:00",
+      "duration_min": 60,
+      "location": "Zoom",
+      "notes": "Bring the roadmap slides."
+    },
+    {
+      "id": "ev2",
+      "title": "Dentist appointment",
+      "date": "2026-08-11",
+      "time": "09:30",
+      "duration_min": 45,
+      "location": "Downtown Dental",
+      "notes": ""
+    },
+    {
+      "id": "ev3",
+      "title": "Team standup",
+      "date": "2026-08-06",
+      "time": "10:00",
+      "duration_min": 15,
+      "location": "Zoom",
+      "notes": "Daily sync."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Send Q3 roadmap slides to Priya",
+      "due": "2026-08-06",
+      "done": false,
+      "priority": "high"
+    },
+    {
+      "id": "t2",
+      "title": "Renew library books",
+      "due": "2026-08-09",
+      "done": false,
+      "priority": "low"
+    },
+    {
+      "id": "t3",
+      "title": "Reply to Daniel about coffee",
+      "due": "2026-08-07",
+      "done": false,
+      "priority": "medium"
+    }
+  ]
+}

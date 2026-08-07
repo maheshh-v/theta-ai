@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local scratch / OS
+*.tmp
+data/*.json.tmp
+.DS_Store
+Thumbs.db
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.gradio/
