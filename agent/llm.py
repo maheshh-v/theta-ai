@@ -46,7 +46,12 @@ class GeminiLLM(BaseLLM):
     name = "gemini"
     BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     # Tried in order; resilient to Google renaming/retiring flash models.
-    FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    FALLBACK_MODELS = [
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]
 
     def __init__(self) -> None:
         if not settings.gemini_api_key:
@@ -77,7 +82,10 @@ class GeminiLLM(BaseLLM):
                 last_err = f"model '{model}' not found (404)"
                 continue
             if resp.status_code == 429:
-                raise LLMError("Gemini rate limit hit (HTTP 429). Try again shortly.")
+                # Quota/rate limits are often per-model — try the next candidate
+                # before giving up entirely.
+                last_err = f"model '{model}' rate-limited (429)"
+                continue
             if resp.status_code in (400, 401, 403):
                 raise LLMError(
                     f"Gemini rejected the request (HTTP {resp.status_code}). "

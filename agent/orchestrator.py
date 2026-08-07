@@ -202,25 +202,29 @@ def _parse_action(text: str) -> dict | None:
             cleaned = cleaned[4:]
     cleaned = cleaned.strip()
 
-    # Fast path.
-    try:
-        obj = json.loads(cleaned)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
+    obj = _try_json_variants(cleaned)
+    if obj is not None:
+        return obj
 
-    # Fallback: grab the outermost {...}.
+    # Fallback: grab the outermost {...} and retry the same variants on it.
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         snippet = cleaned[start : end + 1]
+        return _try_json_variants(snippet)
+    return None
+
+
+def _try_json_variants(snippet: str) -> dict | None:
+    """Try parsing as-is, then with escaped quotes/newlines unescaped — some
+    models wrap their JSON action in an extra layer of string-escaping."""
+    for candidate in (snippet, snippet.replace('\\"', '"').replace("\\n", "\n")):
         try:
-            obj = json.loads(snippet)
-            if isinstance(obj, dict):
-                return obj
+            obj = json.loads(candidate)
         except json.JSONDecodeError:
-            return None
+            continue
+        if isinstance(obj, dict):
+            return obj
     return None
 
 
