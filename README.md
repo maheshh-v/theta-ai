@@ -137,7 +137,8 @@ which is how you handle logins.
    ├─ /api/do, /api/do/resume        → the agent loop (resumable)
    ├─ /api/playbooks[/{id}/run]      → record + replay
    ├─ /api/runs[/{id}/shot/…]        → the audit trail
-   └─ /api/settings[/test]           → model + search config
+   ├─ /api/settings[/test]           → model + search config
+   └─ /api/connections, /api/auth/…  → Notion token, Gmail OAuth
       │
       ▼
   Agent loop (agent/orchestrator.py) — ReAct, one JSON action per step,
@@ -147,6 +148,8 @@ which is how you handle logins.
             ├─ browser    → navigate, snapshot, click, type, select, scroll, read…
             ├─ workspace  → file_write / file_read / file_list (sandboxed)
             ├─ web        → web_search, web_read
+            ├─ notion     → search, read page/database, create, edit, set properties
+            ├─ gmail      → search, read, thread, draft reply, send ⚠
             └─ briefs     → brief_list, brief_read
 ```
 
@@ -158,6 +161,38 @@ described in full.
 
 The browser and workspace are real MCP servers — point any MCP client at
 `tools/servers/browser_server.py` and you have a browser-operating tool set.
+
+### Connected accounts: Notion and Gmail
+
+Some things should not be done by clicking. Theta is headless and never types a
+password, so it cannot get past a sign-in wall in the browser — which makes an
+API connection the difference between "I can't help with that" and doing the job.
+Two are wired in, and they are wired into the *same* machinery as everything else
+rather than bolted on beside it:
+
+- **Credentials are reserved parameters.** The model asks for the action; the
+  manager supplies the authority. `notion_token` and `access_token` are injected
+  at call time, hidden from the tool list the model sees, and stripped from the
+  recorded run — exactly like the search key already was.
+- **Sending is the only new approval gate.** `gmail_send_reply` is in
+  `ALWAYS_CONFIRM`, and the approval card shows the message with the text
+  **editable before you approve it**. Drafting needs no approval, because a draft
+  goes nowhere.
+- **Emails and Notion pages are untrusted content.** Anyone can put text in front
+  of the agent by writing to you, so bodies go through the same `<untrusted>`
+  fence and injection scan as a scraped web page.
+- **Every write verifies itself.** `notion_update_page` re-reads the page and
+  checks the new text is on it; `gmail_send_reply` re-reads the message and checks
+  it is really in Sent Mail. Both return `verified`, and the trace says
+  *"⚠️ not verified"* when it is false. An HTTP 200 is not evidence.
+- **They replay as Playbooks.** Records addressed by id cannot drift the way page
+  elements do, so a cross-app routine — *pull last week's invoices out of Gmail,
+  append them to the Notion tracker* — replays with no model calls. `gmail_send_reply`
+  is excluded from replay on purpose: replay skips approval gates, and one
+  approved send must not become standing permission to send.
+
+Notion needs an integration token; Gmail needs an OAuth client. Both are set up in
+**Settings → Connections** — see `.env.example`.
 
 ### Research is still here, as one tool
 
@@ -179,13 +214,18 @@ It is a supporting capability now, not the product.
 - **Filesystem sandbox.** All output lands under `data/workspace`; paths that
   escape it, and executable extensions, are refused.
 - **Approval before consequences**, and edits at the approval step are restricted
-  to parameters the tool actually declares.
+  to parameters the tool actually declares — so approving a send can change the
+  message text but can never inject a credential.
+- **Least privilege on connected accounts.** Gmail is asked for read, compose and
+  send only — never `gmail.modify` — so Theta cannot label, archive or delete
+  mail even if something talked it into trying. Google tokens are refreshed
+  server-side and both halves are registered with the log scrubber.
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-pytest              # 172 tests, fully offline — no browser, no network
+pytest              # 247 tests, fully offline — no browser, no network
 python selftest.py  # boots the real MCP stack and drives a real website
 ```
 
@@ -210,7 +250,9 @@ set `GEMINI_API_KEY`, `THETA_SECRET_KEY` and `THETA_COOKIE_SECURE=1` in secrets.
   clickable. The observation says so rather than looking blind — but a
   payment form in an iframe will stop Theta.
 - **Logins are yours.** By design. Run headful and type it yourself; Theta
-  continues from there.
+  continues from there. For Notion and Gmail this is solved properly — connect
+  the account once in Settings and the browser is never involved. Every other
+  site still needs you.
 - **Sites that fight automation will win.** Aggressive bot detection, Cloudflare
   interstitials and CAPTCHAs are not worked around.
 - **One browser, one user.** The browser lives in a single MCP subprocess, so a
@@ -219,6 +261,28 @@ set `GEMINI_API_KEY`, `THETA_SECRET_KEY` and `THETA_COOKIE_SECURE=1` in secrets.
   turn. Gemini Flash or an 8B+ Ollama model is the realistic floor.
 - **DuckDuckGo throttles.** Keyless search is best-effort; add a Tavily key for
   real use. Theta reports the failure instead of inventing results.
+
+## Attribution
+
+No third-party code is vendored here, but three projects shaped decisions in it
+and deserve naming:
+
+- **[browser-use](https://github.com/browser-use/browser-use)** — the indexed
+  interactive-element snapshot, so the agent names a control instead of guessing
+  a coordinate. `browser/snapshot.py`.
+- **[Notion's MCP server](https://github.com/makenotion/notion-mcp-server)**
+  (MIT, © 2025 Notion Labs, Inc.) — the endpoint set, operation shapes and
+  per-operation API versions in `integrations/notion/api.py` come from the
+  OpenAPI spec published there. Their key insight is treating a page as Markdown
+  via `/v1/pages/{id}/markdown` rather than walking the block tree; Theta uses
+  the same two endpoints. That project generates all 22 of its tools from the
+  spec at runtime, where Theta hand-picks the six it needs.
+- **[Google's Workspace MCP server](https://github.com/gemini-cli-extensions/workspace)**
+  (Apache-2.0, © 2026 Google LLC) — the reply-header handling in
+  `integrations/google/gmail.py` follows theirs: chain `References` from the
+  previous message's own `References` plus its `Message-ID`, rather than starting
+  the chain afresh, which is what keeps a conversation threaded past the second
+  message. Theta requests narrower scopes than they do.
 
 ## License
 

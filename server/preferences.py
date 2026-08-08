@@ -15,7 +15,7 @@ from __future__ import annotations
 from agent import llm as llm_mod
 from agent.llm import BaseLLM, LLMError
 from config import LLM_PROVIDERS, SEARCH_PROVIDERS, settings
-from server import security
+from server import accounts, security
 from server.session import Session
 from tools import web_tools
 from tools.mcp_client import ToolContext
@@ -117,7 +117,26 @@ def tool_context(session: Session, llm: BaseLLM) -> ToolContext:
             "per_question": r["sources_per_question"],
             "max_sources": r["max_sources"],
         },
+        credentials=credentials(session),
     )
+
+
+def credentials(session: Session) -> dict:
+    """Credentials for connected accounts, keyed by the reserved parameter the
+    matching MCP server expects. Resolved here, once per run, so no tool call
+    reaches into the session and no credential passes through the model.
+
+    Google's access token is refreshed on the way out; a missing or unrefreshable
+    one simply stays absent, and the tool reports "not connected".
+    """
+    out: dict[str, str] = {}
+    notion = accounts.notion_token(session)
+    if notion:
+        out["notion_token"] = notion
+    google = accounts.google_access_token(session)
+    if google:
+        out["access_token"] = google
+    return out
 
 
 def approves_research(session: Session) -> bool:
@@ -172,6 +191,8 @@ def public_config(session: Session) -> dict:
         "browser_headless": r["browser_headless"],
         "browser_size": f"{settings.browser_width}×{settings.browser_height}",
         "max_steps": settings.max_agent_steps,
+
+        "connections": accounts.status(session),
     }
 
 
@@ -217,6 +238,11 @@ def update(session: Session, data: dict) -> None:
     elif str(data.get("search_api_key", "")).strip():
         session.set(_SEARCH_KEY, str(data["search_api_key"]).strip())
 
+    if data.get("clear_notion_token"):
+        accounts.notion_disconnect(session)
+    elif str(data.get("notion_token", "")).strip():
+        session.set(accounts.NOTION_KEY, str(data["notion_token"]).strip())
+
 
 # --------------------------------------------------------------------------- #
 # Connection tests                                                            #
@@ -258,3 +284,31 @@ def test_search(session: Session, data: dict | None = None) -> tuple[bool, str]:
         return web_tools.search_status(provider, key)
     except Exception as ex:  # pragma: no cover - defensive
         return False, f"Unexpected error: {ex}"
+
+
+def test_notion(session: Session, data: dict | None = None) -> tuple[bool, str]:
+    """Ask Notion who the token belongs to, using the pending form value first.
+
+    A Notion token that authenticates but has been shared with nothing is the
+    common failure, and it looks identical to a working one until a task fails —
+    so the message says what to do about it either way.
+    """
+    from integrations.notion import api as notion_api
+
+    data = data or {}
+    token = str((data or {}).get("notion_token") or accounts.notion_token(session) or "").strip()
+    if not token:
+        return False, "No Notion token yet. Paste an integration secret above."
+    security.register_secret(token)
+    try:
+        who = notion_api.whoami(token)
+    except notion_api.NotionError as ex:
+        return False, str(ex)
+    except Exception as ex:  # pragma: no cover - defensive
+        return False, f"Unexpected error: {ex}"
+
+    name = who.get("name") or who.get("workspace") or "your integration"
+    return True, (
+        f"Connected as “{name}”. Theta can only see pages shared with this "
+        "integration — in Notion use ⋯ → Connections on each page or database."
+    )

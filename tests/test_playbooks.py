@@ -200,6 +200,97 @@ def test_an_empty_playbook_is_refused(manager):
 
 
 # --------------------------------------------------------------------------- #
+# Account-backed steps (Notion, Gmail)                                        #
+# --------------------------------------------------------------------------- #
+NOTION_PAGE = "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.fixture
+def cross_app_run():
+    """The routine the integrations exist for: read the mail, write it up."""
+    return make_run([
+        ("gmail_search", {"query": "invoice newer_than:7d", "access_token": "ya29.secret"}, None),
+        ("notion_update_page", {"page_id": NOTION_PAGE, "find": "Ship the thing",
+                                "replace": "Ship the thing (invoices in)",
+                                "notion_token": "ntn_secret"}, None),
+    ])
+
+
+def test_account_backed_steps_record_as_replayable(cross_app_run):
+    pb = from_run(cross_app_run)
+    assert [s.action for s in pb.steps] == ["api:gmail_search", "api:notion_update_page"]
+
+
+def test_a_playbook_never_stores_a_credential(cross_app_run):
+    """Tokens are reserved parameters, injected fresh at replay time. A saved
+    automation on disk must not be a place secrets accumulate."""
+    blob = json.dumps(from_run(cross_app_run).to_dict())
+    assert "ya29.secret" not in blob
+    assert "ntn_secret" not in blob
+
+
+def test_sending_email_is_never_recorded_into_an_automation():
+    """Replay skips approval gates by design, so an approved send must not
+    become standing permission to send unattended."""
+    record = make_run([
+        ("gmail_draft_reply", {"message_id": "m1", "body": "ok"}, None),
+        ("gmail_send_reply", {"message_id": "m1", "body": "ok"}, None),
+    ])
+    assert [s.action for s in from_run(record).steps] == ["api:gmail_draft_reply"]
+
+
+def test_free_text_becomes_an_input_while_ids_stay_fixed(cross_app_run):
+    pb = from_run(cross_app_run)
+    args = pb.steps[1].target["args"]
+
+    assert args["page_id"] == NOTION_PAGE            # the target is the automation
+    assert args["find"].startswith("{{")             # the text is the input
+    assert {p.default for p in pb.params} >= {"invoice newer_than:7d", "Ship the thing"}
+
+
+def test_inputs_substitute_into_account_backed_steps(cross_app_run):
+    pb = from_run(cross_app_run)
+    query = next(p for p in pb.params if p.default.startswith("invoice"))
+
+    resolved = pb.resolve({query.name: "receipt newer_than:1d"})
+    assert resolved[0].target["args"]["query"] == "receipt newer_than:1d"
+    assert pb.steps[0].target["args"]["query"].startswith("{{")   # stored copy intact
+
+
+def test_account_backed_steps_describe_themselves_for_the_ui(cross_app_run):
+    pb = from_run(cross_app_run)
+    # Stored steps show the placeholder, resolved ones the value — same as a
+    # recorded `type` step does.
+    assert pb.steps[0].describe() == "Searching Gmail: “{{gmail_search_query}}”"
+    assert pb.steps[1].describe().startswith("Editing a Notion page")
+    assert pb.resolve({})[0].describe() == "Searching Gmail: “invoice newer_than:7d”"
+
+
+def test_replaying_a_cross_app_playbook_hits_both_services(
+    cross_app_run, manager, fake_gmail, fake_notion
+):
+    pb = playbooks.save(from_run(cross_app_run))
+    context = ToolContext(credentials={"access_token": "ya29.test-access-token",
+                                       "notion_token": fake_notion.TOKEN})
+
+    record = replay(pb, {}, manager, context, llm=None, allow_heal=False)
+
+    assert record.status == "done"
+    assert "Ship the thing (invoices in)" in fake_notion.markdown[NOTION_PAGE]
+    assert any(path == "/messages" for _m, path in fake_gmail.calls)
+    assert "no model needed" in record.answer
+
+
+def test_a_replay_without_the_account_connected_fails_with_advice(cross_app_run, manager):
+    pb = playbooks.save(from_run(cross_app_run))
+
+    record = replay(pb, {}, manager, ToolContext(), llm=None, allow_heal=False)
+
+    assert record.status == "failed"
+    assert "Connections" in record.steps[0].summary
+
+
+# --------------------------------------------------------------------------- #
 # Self-healing                                                                #
 # --------------------------------------------------------------------------- #
 def test_a_broken_step_is_re_found_and_written_back(recorded_run, manager, page, script_llm):

@@ -93,6 +93,18 @@ class Settings:
     tavily_api_key: str = _env("TAVILY_API_KEY")
     brave_api_key: str = _env("BRAVE_API_KEY")
 
+    # --- Connected services (optional) ------------------------------------- #
+    # Notion: an internal integration secret ("ntn_…"). A token set per-session
+    # in Settings wins; this is the server-wide default for a single-user deploy.
+    notion_token: str = _env("NOTION_TOKEN")
+
+    # Gmail: a standard OAuth 2.0 web-application client. Theta never sees a
+    # Google password — the user consents in Google's own flow and Theta keeps
+    # only the resulting tokens, encrypted.
+    google_client_id: str = _env("GOOGLE_CLIENT_ID")
+    google_client_secret: str = _env("GOOGLE_CLIENT_SECRET")
+    google_redirect_uri: str = _env("GOOGLE_REDIRECT_URI")
+
     # --- Browser ----------------------------------------------------------- #
     # Headful lets you watch the agent work and take the keyboard yourself —
     # which is what Theta asks you to do whenever a site wants a password.
@@ -170,6 +182,12 @@ class Settings:
         if self.llm_provider == "openai":
             return bool(self.openai_api_key)
         return True  # Ollama needs no key; reachability is checked on use
+
+    @property
+    def google_configured(self) -> bool:
+        """Whether Gmail *can* be connected. Unlike a Notion token, a user cannot
+        supply this themselves — an OAuth client belongs to the deployment."""
+        return bool(self.google_client_id and self.google_client_secret)
 
     @property
     def search_configured(self) -> bool:

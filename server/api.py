@@ -10,16 +10,25 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 
 from agent.llm import LLMError
 from automation.playbooks import from_run, playbooks
 from automation.runs import runs
+from config import settings
+from integrations.google import oauth
 from research.briefs import store as briefs
 from research.render import to_markdown
-from server import chat, preferences
+from server import accounts, chat, preferences
 from server.session import current_session
 from tools import catalog
 
@@ -310,6 +319,82 @@ async def test_search(request: Request) -> dict:
     data = await _json_body(request)
     ok, message = preferences.test_search(current_session(request), data)
     return {"ok": ok, "message": message}
+
+
+@router.post("/settings/test-notion")
+async def test_notion(request: Request) -> dict:
+    data = await _json_body(request)
+    ok, message = preferences.test_notion(current_session(request), data)
+    return {"ok": ok, "message": message}
+
+
+# --------------------------------------------------------------------------- #
+# Connections — Notion and Gmail                                              #
+# --------------------------------------------------------------------------- #
+@router.get("/connections")
+def connections(request: Request) -> dict:
+    """Which accounts are connected. Never carries a credential."""
+    return accounts.status(current_session(request))
+
+
+@router.post("/connections/notion/disconnect")
+def notion_disconnect(request: Request) -> dict:
+    accounts.notion_disconnect(current_session(request))
+    return {"status": "disconnected"}
+
+
+@router.get("/auth/google/login")
+def google_login(request: Request):
+    """Start the OAuth flow. The password is typed on Google's page, not ours."""
+    if not settings.google_configured:
+        return JSONResponse(
+            {"error": "google_not_configured", "message": _GOOGLE_SETUP_HINT},
+            status_code=400,
+        )
+    session = current_session(request)
+    state = secrets.token_urlsafe(24)
+    session.set("oauth_state", state)
+    return RedirectResponse(oauth.build_auth_url(state), status_code=302)
+
+
+@router.get("/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    session = current_session(request)
+    expected = session.pop("oauth_state", None)
+
+    def back(**params) -> RedirectResponse:
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        return RedirectResponse(f"/?view=settings&{query}", status_code=302)
+
+    if error:
+        return back(auth_error=error)
+    # A missing or mismatched state means this callback did not come from a flow
+    # this session started — the CSRF check, and it is not optional.
+    if not code or not state or state != expected:
+        return back(auth_error="state_mismatch")
+    try:
+        token = oauth.exchange_code(code)
+    except oauth.GoogleAuthError as ex:
+        _log.warning("Google OAuth exchange failed: %s", ex)
+        return back(auth_error="exchange_failed")
+
+    session.set(accounts.GOOGLE_KEY, token)
+    _log.info("Connected Gmail for %s", token.get("email") or "(unknown account)")
+    return back(connected="google")
+
+
+@router.post("/auth/google/disconnect")
+def google_disconnect(request: Request) -> dict:
+    accounts.google_disconnect(current_session(request))
+    return {"status": "disconnected"}
+
+
+_GOOGLE_SETUP_HINT = (
+    "Gmail needs a Google OAuth client, which belongs to the deployment rather "
+    "than to you. Create one at console.cloud.google.com (Web application), add "
+    f"{oauth.redirect_uri()} as an authorised redirect URI, enable the Gmail API, "
+    "then set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and restart Theta."
+)
 
 
 async def _json_body(request: Request) -> dict:

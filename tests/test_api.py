@@ -353,3 +353,96 @@ def test_out_of_range_values_are_clamped(client):
 def test_unknown_providers_are_ignored(client):
     body = client.post("/api/settings", json={"provider": "not-real"}).json()
     assert body["provider"] in {"gemini", "ollama", "openai"}
+
+
+# --------------------------------------------------------------------------- #
+# Connections                                                                 #
+# --------------------------------------------------------------------------- #
+def test_nothing_is_connected_to_begin_with(client):
+    body = client.get("/api/connections").json()
+    assert body["notion"]["connected"] is False
+    assert body["google"]["connected"] is False
+
+
+def test_a_notion_token_is_stored_masked_and_never_returned(client):
+    client.post("/api/settings", json={"notion_token": "ntn_SUPERSECRETVALUE"})
+    body = client.get("/api/connections").json()
+
+    assert "ntn_SUPERSECRETVALUE" not in json.dumps(body)
+    assert body["notion"]["connected"] is True
+    assert "•" in body["notion"]["token_masked"]
+    assert body["notion"]["token_source"] == "session"
+
+
+def test_saving_settings_without_a_token_keeps_the_stored_one(client):
+    client.post("/api/settings", json={"notion_token": "ntn_KEEPME12345678"})
+    client.post("/api/settings", json={"provider": "gemini", "notion_token": ""})
+
+    assert client.get("/api/connections").json()["notion"]["connected"] is True
+
+
+def test_disconnecting_notion_forgets_the_token(client):
+    client.post("/api/settings", json={"notion_token": "ntn_FORGETME1234567"})
+    client.post("/api/connections/notion/disconnect")
+
+    assert client.get("/api/connections").json()["notion"]["connected"] is False
+
+
+def test_testing_notion_without_a_token_says_so(client):
+    body = client.post("/api/settings/test-notion", json={}).json()
+    assert body["ok"] is False and "No Notion token" in body["message"]
+
+
+def test_testing_notion_reports_the_workspace_and_the_sharing_caveat(client, fake_notion):
+    body = client.post("/api/settings/test-notion",
+                       json={"notion_token": fake_notion.TOKEN}).json()
+
+    assert body["ok"] is True
+    assert "Acme" in body["message"] or "Theta" in body["message"]
+    assert "shared with this integration" in body["message"]
+
+
+def test_connecting_gmail_without_an_oauth_client_explains_why(client):
+    resp = client.get("/api/auth/google/login")
+    assert resp.status_code == 400
+    assert "GOOGLE_CLIENT_ID" in resp.json()["message"]
+
+
+def test_the_oauth_callback_rejects_a_state_it_did_not_issue(client, monkeypatch):
+    """Without the state check any site could complete a sign-in into this
+    session — it is the CSRF defence, not a formality."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "google_client_id", "id", raising=False)
+    monkeypatch.setattr(settings, "google_client_secret", "secret", raising=False)
+
+    resp = client.get("/api/auth/google/callback?code=abc&state=forged",
+                      follow_redirects=False)
+
+    assert resp.status_code == 302
+    assert "auth_error=state_mismatch" in resp.headers["location"]
+
+
+def test_a_cancelled_sign_in_returns_to_settings_with_the_reason(client):
+    resp = client.get("/api/auth/google/callback?error=access_denied",
+                      follow_redirects=False)
+
+    assert resp.headers["location"].startswith("/?view=settings")
+    assert "auth_error=access_denied" in resp.headers["location"]
+
+
+def test_the_tool_list_never_exposes_a_credential_parameter(client):
+    body = client.get("/api/tools").json()
+    names = {t["name"] for t in body["tools"]}
+    assert {"notion_search", "gmail_search", "gmail_send_reply"} <= names
+
+    for tool in body["tools"]:
+        assert "access_token" not in tool["params"]
+        assert "notion_token" not in tool["params"]
+
+
+def test_sending_email_is_the_only_new_tool_that_asks_first(client):
+    body = client.get("/api/tools").json()
+    gated = {t["name"] for t in body["tools"]
+             if t["tag"] == "confirm" and (t["name"].startswith(("gmail_", "notion_")))}
+    assert gated == {"gmail_send_reply"}

@@ -25,9 +25,26 @@ from config import settings
 from server import security
 
 # Keys whose values are secrets: registered for log-scrubbing, masked in the UI.
-SECRET_KEYS = {"llm_api_key", "search_api_key"}
+SECRET_KEYS = {"llm_api_key", "search_api_key", "notion_token", "google_token"}
 
 _COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+
+
+def _register(value) -> None:
+    """Register a secret with the log scrubber, reaching inside containers.
+
+    An OAuth token is a dict, and registering its JSON dump would scrub only the
+    exact serialisation — never the access token as it actually appears in a log
+    line. So the leaves are registered, not the wrapper.
+    """
+    if isinstance(value, str):
+        security.register_secret(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _register(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _register(item)
 
 
 class Session:
@@ -44,9 +61,7 @@ class Session:
     def set(self, key: str, value) -> None:
         self._data[key] = value
         if key in SECRET_KEYS:
-            security.register_secret(
-                value if isinstance(value, str) else json.dumps(value)
-            )
+            _register(value)
         self._store.save()
 
     def pop(self, key: str, default=None):
@@ -79,11 +94,8 @@ class SessionStore:
             self._sessions = json.loads(raw)
             for data in self._sessions.values():
                 for k in SECRET_KEYS:
-                    v = data.get(k)
-                    if v:
-                        security.register_secret(
-                            v if isinstance(v, str) else json.dumps(v)
-                        )
+                    if data.get(k):
+                        _register(data[k])
         except Exception:
             # A stale/undecryptable file (e.g. key rotated) starts fresh.
             self._sessions = {}

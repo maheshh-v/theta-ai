@@ -66,6 +66,10 @@ class ToolContext:
     # Returns the file path for the next browser screenshot. The run owns naming;
     # the browser server just writes where it is told.
     shot_path_factory: Optional[Callable[[], str]] = None
+    # Credentials for connected accounts, resolved per request in
+    # `server/preferences.py`. Keyed by the reserved parameter each server
+    # expects, so adding a service needs no change here.
+    credentials: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -90,6 +94,8 @@ def _server_specs() -> list[tuple[str, str]]:
         ("workspace", str(d / "workspace_server.py")),
         ("web", str(d / "web_server.py")),
         ("briefs", str(d / "briefs_server.py")),
+        ("notion", str(d / "notion_server.py")),
+        ("gmail", str(d / "gmail_server.py")),
     ]
 
 
@@ -270,6 +276,19 @@ class MCPManager:
                 arguments["search_provider"] = context.search_provider
             if context.search_key:
                 arguments["search_api_key"] = context.search_key
+
+        # Inject the connected account's credential, same principle: the model
+        # asks for the action, the server supplies the authority. A service that
+        # is not connected fails here with an instruction, not a stack trace.
+        credential = catalog.credential_param(server)
+        if credential:
+            value = (context.credentials or {}).get(credential) if context else None
+            if not value:
+                return ToolResult(ok=False, source="—", content={
+                    "error": "not_connected",
+                    "message": catalog.connection_hint(server),
+                })
+            arguments[credential] = value
 
         # Tell the browser where to put this step's screenshot.
         if catalog.needs_screenshot(server) and context is not None:

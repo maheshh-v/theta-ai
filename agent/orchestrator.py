@@ -293,7 +293,7 @@ class AgentRun:
 # --------------------------------------------------------------------------- #
 def _render_tools(tools: list[ToolInfo]) -> str:
     """Group tools by server so the model sees capabilities, not a flat list."""
-    order = ["browser", "workspace", "web", "briefs", "theta"]
+    order = ["browser", "notion", "gmail", "workspace", "web", "briefs", "theta"]
     groups: dict[str, list[str]] = {}
     for t in tools:
         if t.name in catalog.HIDDEN_TOOLS:

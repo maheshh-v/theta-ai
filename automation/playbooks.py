@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from secrets import token_urlsafe
 
 from config import settings
+from tools import catalog
 
 _ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 PARAM_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
@@ -41,6 +42,36 @@ REPLAYABLE = {
     "browser_back": "back",
     "file_write": "file_write",
 }
+
+# Account-backed tools replay verbatim: they address records by id rather than by
+# position on a page, so there is nothing to re-find and nothing to heal. This is
+# what makes a cross-app routine — pull last week's invoices out of Gmail, append
+# them to the Notion tracker — cost nothing to repeat.
+#
+# `gmail_send_reply` is deliberately absent. Replay skips approval gates by
+# design, and one approved send must not become standing permission to send.
+API_REPLAYABLE = {
+    "notion_search", "notion_read_page", "notion_read_database",
+    "notion_create_page", "notion_update_page", "notion_update_properties",
+    "gmail_search", "gmail_read", "gmail_thread", "gmail_draft_reply",
+}
+
+# Arguments that are the user's *input* rather than the automation's fixed
+# target, so they become editable parameters. Ids stay literal — they are what
+# the playbook points at.
+TEMPLATED_ARGS = ("query", "title", "markdown", "content", "body", "find", "replace")
+
+API_PREFIX = "api:"
+
+
+def replayable_tools() -> set[str]:
+    """Every tool a completed run can contribute to a playbook.
+
+    Approval-gated tools are removed here rather than merely omitted from the
+    lists above, so adding one to `ALWAYS_CONFIRM` is enough to keep it out of
+    unattended replay for good.
+    """
+    return (set(REPLAYABLE) | API_REPLAYABLE) - catalog.ALWAYS_CONFIRM
 
 
 @dataclass
@@ -66,6 +97,9 @@ class PlaybookStep:
 
     def describe(self) -> str:
         what = self.target.get("describe") or self.target.get("name") or ""
+        if self.action.startswith(API_PREFIX):
+            return _describe_api(self.action[len(API_PREFIX):],
+                                 (self.target or {}).get("args") or {})
         if self.action == "navigate":
             return f"Open {self.value}"
         if self.action == "type":
@@ -144,6 +178,12 @@ class Playbook:
             if filled.action == "file_write":
                 filled.target = dict(step.target)
                 filled.target["name"] = fill(str(step.target.get("name", "")))
+            elif filled.action.startswith(API_PREFIX):
+                args = dict((step.target or {}).get("args") or {})
+                filled.target = dict(step.target or {})
+                filled.target["args"] = {
+                    k: (fill(v) if isinstance(v, str) else v) for k, v in args.items()
+                }
             out.append(filled)
         return out
 
@@ -161,11 +201,16 @@ def from_run(run, name: str = "", description: str = "") -> Playbook:
     steps: list[PlaybookStep] = []
     params: list[Param] = []
     seen_params: set[str] = set()
+    allowed = replayable_tools()
 
     for rs in run.steps:
-        action = REPLAYABLE.get(rs.tool)
-        if action is None or rs.status != "done" or not rs.ok:
+        if rs.tool not in allowed or rs.status != "done" or not rs.ok:
             continue
+        if rs.tool in API_REPLAYABLE:
+            steps.append(_api_step(rs, params, seen_params))
+            continue
+
+        action = REPLAYABLE[rs.tool]
         args = dict(rs.args or {})
 
         if action == "navigate":
@@ -215,6 +260,43 @@ def from_run(run, name: str = "", description: str = "") -> Playbook:
         params=params,
         steps=steps,
     )
+
+
+def _api_step(rs, params: list, seen: set) -> PlaybookStep:
+    """Record one Notion/Gmail call as a step that replays verbatim.
+
+    The credential is not stored — it is a reserved parameter, injected fresh
+    from the session at replay time, so a playbook never carries a token.
+    """
+    args = {k: v for k, v in (rs.args or {}).items() if k not in catalog.RESERVED_PARAMS}
+    for key in TEMPLATED_ARGS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            pname = _param_name({"name": f"{rs.tool}_{key}"}, len(params) + 1, seen)
+            params.append(Param(
+                name=pname,
+                label=f"{catalog.label_for(rs.tool)} — {key}",
+                default=value, example=value,
+            ))
+            args[key] = "{{%s}}" % pname
+    return PlaybookStep(
+        action=f"{API_PREFIX}{rs.tool}",
+        target={"args": args},
+        note=catalog.label_for(rs.tool),
+    )
+
+
+def _describe_api(tool: str, args: dict) -> str:
+    label = catalog.label_for(tool)
+    for key in ("query", "title", "find"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            return f'{label}: “{value[:60]}”'
+    for key in ("page_id", "database_id", "thread_id", "message_id", "parent_id"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            return f"{label} ({value[:12]}…)"
+    return label
 
 
 def _param_name(target: dict, n: int, seen: set) -> str:

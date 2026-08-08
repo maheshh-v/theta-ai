@@ -11,6 +11,7 @@ live in the tests, where a fake belongs.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -25,6 +26,12 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path, raising=False)
     monkeypatch.setattr(settings, "session_persist", False, raising=False)
     monkeypatch.setattr(settings, "secret_key", "unit-test-secret", raising=False)
+    # Connected-service credentials come from the environment via `.env`, so a
+    # developer who has one configured would otherwise get different results
+    # from the same test. Start every test with nothing connected.
+    for name in ("notion_token", "google_client_id", "google_client_secret",
+                 "google_redirect_uri"):
+        monkeypatch.setattr(settings, name, "", raising=False)
     for name in ("briefs", "runs", "playbooks", "workspace"):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
 
@@ -43,8 +50,8 @@ def no_network(monkeypatch):
     def blocked(*args, **kwargs):
         raise AssertionError("a test tried to make a real HTTP request")
 
-    monkeypatch.setattr(requests, "get", blocked)
-    monkeypatch.setattr(requests, "post", blocked)
+    for verb in ("get", "post", "patch", "request"):
+        monkeypatch.setattr(requests, verb, blocked)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +260,323 @@ def script_llm():
 @pytest.fixture
 def tool_then_final():
     return ToolThenFinal
+
+
+# --------------------------------------------------------------------------- #
+# Connected services: Notion and Gmail, in memory                             #
+# --------------------------------------------------------------------------- #
+class FakeResponse:
+    """Just enough of `requests.Response` for the integration layers."""
+
+    def __init__(self, status_code: int, payload=None) -> None:
+        self.status_code = status_code
+        self._payload = {} if payload is None else payload
+        self.content = b"" if payload is None else b"{}"
+
+    def json(self):
+        return self._payload
+
+
+class FakeService:
+    """Base for a service double patched in at the `requests` boundary.
+
+    Services chain: each one handles its own host and passes anything else to
+    whatever was installed before it, so a test can ask for `fake_gmail` and
+    `fake_notion` together and get both. Without the chain the second fixture
+    would silently displace the first.
+    """
+
+    HOST = ""
+
+    def __init__(self, nxt) -> None:
+        self._next = nxt
+
+    def __call__(self, method, url, **kw):
+        if self.HOST not in url:
+            return self._next(method, url, **kw)
+        return self.handle(method, url, **kw)
+
+    def handle(self, method, url, **kw):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+def _install(monkeypatch, cls):
+    import requests
+
+    fake = cls(requests.request)
+    monkeypatch.setattr(requests, "request", fake)
+    return fake
+
+
+class FakeNotion(FakeService):
+    """A small Notion: pages with properties, page bodies as Markdown, and one
+    database. Patched in at the `requests` boundary, so the real status-code
+    handling, headers and version pinning in `integrations/notion/api.py` all run.
+    """
+
+    HOST = "api.notion.com"
+    PAGE = "11111111-1111-1111-1111-111111111111"
+    ROW = "22222222-2222-2222-2222-222222222222"
+    DB = "33333333-3333-3333-3333-333333333333"
+    SOURCE = "44444444-4444-4444-4444-444444444444"
+    TOKEN = "ntn_test_token_value"
+
+    def __init__(self, nxt) -> None:
+        super().__init__(nxt)
+        self.markdown = {
+            self.PAGE: "# Roadmap\n\nShip the thing by Friday.\n",
+            self.ROW: "",
+        }
+        self.pages = {
+            self.PAGE: self._page(self.PAGE, "Roadmap", {}),
+            self.ROW: self._page(self.ROW, "Fix the login wall", {
+                "Status": {"id": "s", "type": "select", "select": {"name": "To do"}},
+                "Priority": {"id": "p", "type": "number", "number": 3},
+                "Tags": {"id": "t", "type": "multi_select", "multi_select": []},
+                "Done": {"id": "d", "type": "checkbox", "checkbox": False},
+                "Age": {"id": "a", "type": "formula",
+                        "formula": {"type": "number", "number": 7}},
+            }),
+        }
+        self.calls: list[tuple[str, str]] = []
+        self.versions: list[str] = []
+        self.forbidden: set[str] = set()      # ids the integration cannot see
+        self.swallow_writes = False           # accept a write, then ignore it
+
+    # -- fixtures ---------------------------------------------------------- #
+    @staticmethod
+    def _title(text):
+        return {"id": "title", "type": "title",
+                "title": [{"type": "text", "plain_text": text, "text": {"content": text}}]}
+
+    def _page(self, pid, title, properties):
+        return {
+            "object": "page", "id": pid,
+            "url": f"https://notion.so/{pid.replace('-', '')}",
+            "last_edited_time": "2026-08-01T10:00:00.000Z",
+            "properties": {"Name": self._title(title), **properties},
+        }
+
+    # -- the router -------------------------------------------------------- #
+    def handle(self, method, url, **kw):
+        path = url.split("api.notion.com", 1)[-1]
+        self.calls.append((method, path))
+        self.versions.append((kw.get("headers") or {}).get("Notion-Version", ""))
+        body = kw.get("json") or {}
+
+        if (kw.get("headers") or {}).get("Authorization") != f"Bearer {self.TOKEN}":
+            return FakeResponse(401, {"object": "error", "code": "unauthorized",
+                                      "message": "API token is invalid."})
+
+        for pid in self.forbidden:
+            if pid in path:
+                return FakeResponse(404, {"object": "error", "code": "object_not_found",
+                                          "message": "Could not find page."})
+
+        if path == "/v1/users/me":
+            return FakeResponse(200, {"id": "bot", "name": "Theta",
+                                      "bot": {"workspace_name": "Acme"}})
+        if path == "/v1/search":
+            return FakeResponse(200, {"results": self._search(body), "has_more": False})
+        if path == "/v1/pages" and method == "POST":
+            return self._create(body)
+        if path == f"/v1/databases/{self.DB}":
+            return FakeResponse(200, {"object": "database", "id": self.DB,
+                                      "url": f"https://notion.so/{self.DB}",
+                                      "title": [{"plain_text": "Bugs"}],
+                                      "data_sources": [{"id": self.SOURCE, "name": "Bugs"}]})
+        if path == f"/v1/data_sources/{self.SOURCE}":
+            return FakeResponse(200, {"object": "data_source", "id": self.SOURCE,
+                                      "properties": self.pages[self.ROW]["properties"]})
+        if path == f"/v1/data_sources/{self.SOURCE}/query":
+            return FakeResponse(200, {"results": [self.pages[self.ROW]], "has_more": False})
+
+        markdown = re.match(r"^/v1/pages/([0-9a-f-]+)/markdown$", path)
+        if markdown:
+            return self._markdown(method, markdown.group(1), body)
+        page = re.match(r"^/v1/pages/([0-9a-f-]+)$", path)
+        if page:
+            return self._page_op(method, page.group(1), body)
+
+        return FakeResponse(404, {"object": "error", "code": "object_not_found",
+                                  "message": f"No route for {path}"})
+
+    # -- operations -------------------------------------------------------- #
+    def _search(self, body):
+        query = str(body.get("query", "")).lower()
+        wanted = ((body.get("filter") or {}).get("value")) or ""
+        hits = []
+        for page in self.pages.values():
+            if wanted == "data_source":
+                continue
+            from integrations.notion.api import title_of
+
+            if not query or query in title_of(page).lower():
+                hits.append(page)
+        if wanted in ("", "data_source") and (not query or "bug" in query):
+            hits.append({"object": "data_source", "id": self.SOURCE,
+                         "title": [{"plain_text": "Bugs"}],
+                         "url": f"https://notion.so/{self.DB}"})
+        return hits
+
+    def _create(self, body):
+        pid = "55555555-5555-5555-5555-555555555555"
+        title = ""
+        for prop in (body.get("properties") or {}).values():
+            if prop.get("title"):
+                title = prop["title"][0]["text"]["content"]
+        self.pages[pid] = self._page(pid, title, {})
+        self.markdown[pid] = ""
+        return FakeResponse(200, self.pages[pid])
+
+    def _markdown(self, method, pid, body):
+        if pid not in self.markdown:
+            return FakeResponse(404, {"object": "error", "code": "object_not_found",
+                                      "message": "Could not find page."})
+        if method == "GET":
+            return FakeResponse(200, {"object": "page_markdown", "id": pid,
+                                      "markdown": self.markdown[pid], "truncated": False})
+        if self.swallow_writes:
+            return FakeResponse(200, {"object": "page_markdown", "id": pid})
+        kind = body.get("type")
+        if kind == "replace_content":
+            self.markdown[pid] = body["replace_content"]["new_str"]
+        elif kind == "update_content":
+            for edit in body["update_content"]["content_updates"]:
+                count = -1 if edit.get("replace_all_matches") else 1
+                self.markdown[pid] = self.markdown[pid].replace(
+                    edit["old_str"], edit["new_str"], count)
+        return FakeResponse(200, {"object": "page_markdown", "id": pid})
+
+    def _page_op(self, method, pid, body):
+        if pid not in self.pages:
+            return FakeResponse(404, {"object": "error", "code": "object_not_found",
+                                      "message": "Could not find page."})
+        if method == "GET":
+            return FakeResponse(200, self.pages[pid])
+        if self.swallow_writes:
+            return FakeResponse(200, self.pages[pid])
+        for name, value in (body.get("properties") or {}).items():
+            kind = next(k for k in value if k != "id")
+            self.pages[pid]["properties"][name] = {"id": name[0], "type": kind, **value}
+        return FakeResponse(200, self.pages[pid])
+
+
+@pytest.fixture
+def fake_notion(monkeypatch):
+    return _install(monkeypatch, FakeNotion)
+
+
+class FakeGmail(FakeService):
+    """A tiny mailbox: two messages on one thread, drafts, and a Sent label."""
+
+    HOST = "gmail.googleapis.com"
+    MSG = "msg-1"
+    THREAD = "thread-1"
+
+    def __init__(self, nxt) -> None:
+        super().__init__(nxt)
+        self.messages = {
+            self.MSG: self._message(
+                self.MSG, self.THREAD,
+                {"From": "Priya <priya@example.com>", "To": "me@example.com",
+                 "Subject": "Invoice for July", "Date": "Mon, 3 Aug 2026 09:00:00 +0100",
+                 "Message-ID": "<abc@example.com>", "References": "<older@example.com>"},
+                "Hi — attaching July's invoice. Could you confirm the total?",
+                ["INBOX", "UNREAD"],
+            ),
+            "msg-2": self._message(
+                "msg-2", self.THREAD,
+                {"From": "me@example.com", "To": "priya@example.com",
+                 "Subject": "Re: Invoice for July", "Message-ID": "<def@example.com>"},
+                "Looking now.", ["SENT"],
+            ),
+        }
+        self.drafts: dict[str, dict] = {}
+        self.sent: list[dict] = []
+        self.calls: list[tuple[str, str]] = []
+        self.label_sent = True       # set False to simulate a send that vanished
+
+    @staticmethod
+    def _message(mid, thread, headers, body, labels):
+        import base64 as _b64
+
+        return {
+            "id": mid, "threadId": thread, "labelIds": list(labels),
+            "snippet": body[:60],
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [{"name": k, "value": v} for k, v in headers.items()],
+                "body": {"data": _b64.urlsafe_b64encode(body.encode()).decode().rstrip("=")},
+            },
+        }
+
+    def handle(self, method, url, **kw):
+        path = url.split("/gmail/v1/users/me", 1)[-1].split("?")[0]
+        self.calls.append((method, path))
+        if not (kw.get("headers") or {}).get("Authorization", "").startswith("Bearer "):
+            return FakeResponse(401, {"error": {"message": "Invalid Credentials"}})
+        body = kw.get("json") or {}
+
+        if path == "/profile":
+            return FakeResponse(200, {"emailAddress": "me@example.com"})
+        if path == "/messages":
+            query = (kw.get("params") or {}).get("q", "")
+            found = [
+                {"id": m["id"], "threadId": m["threadId"]}
+                for m in self.messages.values()
+                if not query or query.lower() in m["snippet"].lower()
+                or query.lower() in self._subject(m).lower()
+            ]
+            return FakeResponse(200, {"messages": found})
+        if path == "/messages/send":
+            return self._send(body)
+        if path == "/drafts" and method == "POST":
+            did = f"draft-{len(self.drafts) + 1}"
+            self.drafts[did] = body.get("message", {})
+            return FakeResponse(200, {"id": did, "message": {"id": f"m-{did}"}})
+        if path.startswith("/drafts/"):
+            did = path.rsplit("/", 1)[-1]
+            if did not in self.drafts:
+                return FakeResponse(404, {"error": {"message": "Draft not found"}})
+            return FakeResponse(200, {"id": did})
+        if path.startswith("/threads/"):
+            tid = path.rsplit("/", 1)[-1]
+            msgs = [m for m in self.messages.values() if m["threadId"] == tid]
+            if not msgs:
+                return FakeResponse(404, {"error": {"message": "Thread not found"}})
+            return FakeResponse(200, {"id": tid, "messages": msgs})
+        if path.startswith("/messages/"):
+            mid = path.rsplit("/", 1)[-1]
+            if mid not in self.messages:
+                return FakeResponse(404, {"error": {"message": "Not Found"}})
+            return FakeResponse(200, self.messages[mid])
+        return FakeResponse(404, {"error": {"message": f"No route for {path}"}})
+
+    @staticmethod
+    def _subject(msg):
+        for h in msg["payload"]["headers"]:
+            if h["name"].lower() == "subject":
+                return h["value"]
+        return ""
+
+    def _send(self, body):
+        import base64 as _b64
+
+        raw = _b64.urlsafe_b64decode(body["raw"] + "=" * (-len(body["raw"]) % 4)).decode()
+        mid = f"sent-{len(self.sent) + 1}"
+        self.sent.append({"raw": raw, "threadId": body.get("threadId", "")})
+        self.messages[mid] = {
+            "id": mid, "threadId": body.get("threadId", ""),
+            "labelIds": ["SENT"] if self.label_sent else ["DRAFT"],
+            "snippet": "", "payload": {"headers": [{"name": "To", "value": "priya@example.com"}]},
+        }
+        return FakeResponse(200, {"id": mid, "threadId": body.get("threadId", "")})
+
+
+@pytest.fixture
+def fake_gmail(monkeypatch):
+    return _install(monkeypatch, FakeGmail)
 
 
 @pytest.fixture

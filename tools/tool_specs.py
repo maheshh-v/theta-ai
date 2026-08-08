@@ -12,9 +12,12 @@ injected by the manager at call time and hidden from the model.
 
 from __future__ import annotations
 
-from tools import brief_tools, browser_tools, web_tools, workspace_tools
+from tools import brief_tools, browser_tools, google_tools, notion_tools, web_tools, workspace_tools
 
 _SHOT = {"shot_path": {"type": "string", "default": ""}}
+# Reserved: injected by the manager from the session's connected account.
+_NOTION = {"notion_token": {"type": "string", "default": ""}}
+_GOOGLE = {"access_token": {"type": "string", "default": ""}}
 
 TOOL_SPECS: list[dict] = [
     # --- browser: the action surface ---
@@ -180,6 +183,155 @@ TOOL_SPECS: list[dict] = [
             "url": {"type": "string", "required": True},
             "search_provider": {"type": "string", "default": ""},
             "search_api_key": {"type": "string", "default": ""},
+        },
+    },
+    # --- notion: pages and databases, as Markdown ---
+    {
+        "name": "notion_search",
+        "server": "notion",
+        "fn": notion_tools.notion_search,
+        "description": (
+            "Find Notion pages and databases by title. Leave query blank to list "
+            'recently edited items. kind="page" or kind="database" narrows it.'
+        ),
+        "parameters": {
+            "query": {"type": "string", "default": ""},
+            "kind": {"type": "string", "default": ""},
+            "limit": {"type": "integer", "default": 10},
+            **_NOTION,
+        },
+    },
+    {
+        "name": "notion_read_page",
+        "server": "notion",
+        "fn": notion_tools.notion_read_page,
+        "description": (
+            "Read a Notion page: its full content as Markdown, plus its database "
+            "properties. Accepts a page id or a Notion URL."
+        ),
+        "parameters": {"page_id": {"type": "string", "required": True}, **_NOTION},
+    },
+    {
+        "name": "notion_read_database",
+        "server": "notion",
+        "fn": notion_tools.notion_read_database,
+        "description": (
+            "Read a Notion database: its property schema and its rows, with each "
+            "row's values flattened to plain text."
+        ),
+        "parameters": {
+            "database_id": {"type": "string", "required": True},
+            "limit": {"type": "integer", "default": 25},
+            **_NOTION,
+        },
+    },
+    {
+        "name": "notion_create_page",
+        "server": "notion",
+        "fn": notion_tools.notion_create_page,
+        "description": (
+            "Create a Notion page under a parent page or database. markdown is the "
+            "page body. Returns the new page's URL and confirms it by reading it back."
+        ),
+        "parameters": {
+            "parent_id": {"type": "string", "required": True},
+            "title": {"type": "string", "required": True},
+            "markdown": {"type": "string", "default": ""},
+            **_NOTION,
+        },
+    },
+    {
+        "name": "notion_update_page",
+        "server": "notion",
+        "fn": notion_tools.notion_update_page,
+        "description": (
+            "Edit a Notion page's content. Prefer find/replace to change part of a "
+            "page; content overwrites the whole page. Read the page first, then "
+            "check the returned `verified` flag."
+        ),
+        "parameters": {
+            "page_id": {"type": "string", "required": True},
+            "content": {"type": "string", "default": ""},
+            "find": {"type": "string", "default": ""},
+            "replace": {"type": "string", "default": ""},
+            "replace_all": {"type": "boolean", "default": False},
+            **_NOTION,
+        },
+    },
+    {
+        "name": "notion_update_properties",
+        "server": "notion",
+        "fn": notion_tools.notion_update_properties,
+        "description": (
+            'Set database properties on a Notion page using plain values, e.g. '
+            '{"Status": "Done", "Priority": 2}. Values are read back afterwards '
+            "and reported in `verified`."
+        ),
+        "parameters": {
+            "page_id": {"type": "string", "required": True},
+            "properties": {"type": "object", "required": True},
+            **_NOTION,
+        },
+    },
+    # --- gmail: read, draft, and (with approval) send ---
+    {
+        "name": "gmail_search",
+        "server": "gmail",
+        "fn": google_tools.gmail_search,
+        "description": (
+            "Search email with Gmail query syntax ('from:priya', 'subject:invoice', "
+            "'is:unread', 'newer_than:7d'). Blank searches the inbox. Returns ids, "
+            "senders, subjects and snippets."
+        ),
+        "parameters": {
+            "query": {"type": "string", "default": ""},
+            "max_results": {"type": "integer", "default": 10},
+            **_GOOGLE,
+        },
+    },
+    {
+        "name": "gmail_read",
+        "server": "gmail",
+        "fn": google_tools.gmail_read,
+        "description": "Read one email in full — headers plus the plain-text body — by its id.",
+        "parameters": {"message_id": {"type": "string", "required": True}, **_GOOGLE},
+    },
+    {
+        "name": "gmail_thread",
+        "server": "gmail",
+        "fn": google_tools.gmail_thread,
+        "description": (
+            "Read a whole email conversation, oldest first. Use this to summarise a "
+            "thread instead of reading each message separately."
+        ),
+        "parameters": {"thread_id": {"type": "string", "required": True}, **_GOOGLE},
+    },
+    {
+        "name": "gmail_draft_reply",
+        "server": "gmail",
+        "fn": google_tools.gmail_draft_reply,
+        "description": (
+            "Draft a reply to an email. Saved to Drafts and NOT sent. Recipient, "
+            "subject and threading come from the original message."
+        ),
+        "parameters": {
+            "message_id": {"type": "string", "required": True},
+            "body": {"type": "string", "required": True},
+            **_GOOGLE,
+        },
+    },
+    {
+        "name": "gmail_send_reply",
+        "server": "gmail",
+        "fn": google_tools.gmail_send_reply,
+        "description": (
+            "Send a reply to an email. The run pauses so the user can read and edit "
+            "the message before anything leaves the mailbox."
+        ),
+        "parameters": {
+            "message_id": {"type": "string", "required": True},
+            "body": {"type": "string", "required": True},
+            **_GOOGLE,
         },
     },
     # --- briefs: past research ---

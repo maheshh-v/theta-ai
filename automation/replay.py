@@ -23,7 +23,7 @@ from typing import Callable
 
 from agent.llm import BaseLLM, LLMError
 from agent.parsing import parse_object
-from automation.playbooks import Playbook, PlaybookStep, playbooks
+from automation.playbooks import API_PREFIX, Playbook, PlaybookStep, playbooks
 from automation.runs import Run, RunStep, runs
 from tools import catalog
 from tools.mcp_client import MCPManager, ToolContext
@@ -90,7 +90,8 @@ def replay(
 
         rs = RunStep(
             index=i,
-            tool=f"playbook_{step.action}",
+            tool=(step.action[len(API_PREFIX):] if step.action.startswith(API_PREFIX)
+                  else f"playbook_{step.action}"),
             args={"value": step.value} if step.value else {},
             label=step.describe(),
             summary=_summarise(step, content, healed),
@@ -137,6 +138,14 @@ def replay(
 # --------------------------------------------------------------------------- #
 def _execute(step: PlaybookStep, mgr, context, llm, playbook, step_index, emit):
     """Run one recorded step, healing it if its element has gone."""
+    # Account-backed steps (Notion, Gmail) address records by id, so they replay
+    # exactly as recorded. Nothing can drift out from under them, and there is
+    # correspondingly nothing to heal.
+    if step.action.startswith(API_PREFIX):
+        tool = step.action[len(API_PREFIX):]
+        args = dict((step.target or {}).get("args") or {})
+        return mgr.call_tool(tool, args, context), False
+
     if step.action == "navigate":
         return mgr.call_tool("browser_navigate", {"url": step.value}, context), False
     if step.action == "scroll":
@@ -247,7 +256,9 @@ def _shot_name(path: str) -> str:
 
 def _summarise(step: PlaybookStep, content: dict, healed: bool) -> str:
     if content.get("error"):
-        return f"⚠️ {str(content['error'])[:90]}"
+        return f"⚠️ {str(content.get('message') or content['error'])[:90]}"
+    if step.action.startswith(API_PREFIX):
+        return catalog.summarize(step.action[len(API_PREFIX):], content)
     base = catalog.summarize(f"browser_{step.action}", content) if step.action not in (
         "file_write", "read"
     ) else None

@@ -118,7 +118,7 @@
     do: ["Do", "Give Theta a goal on the web and watch it work."],
     playbooks: ["Playbooks", "Saved automations. These replay without a model."],
     history: ["History", "Every run Theta has made, step by step."],
-    settings: ["Settings", "Model, search and how Theta behaves."],
+    settings: ["Settings", "Model, connected accounts, search and how Theta behaves."],
   };
   function setView(view) {
     state.view = view;
@@ -296,21 +296,38 @@
           <div class="actions"></div>`;
         $(".what", card).textContent = ev.description || "";
 
-        // Research plans stay editable — the rest are single page actions.
-        let ta = null;
+        // Two things stay editable on the card: a research plan, and the text of
+        // an email before it leaves. Approving something you can't change first
+        // isn't much of a decision. Everything else is one literal page action.
+        const sending = ev.tool === "gmail_send_reply";
+        let ta = null, field = null;
         if (ev.tool === "research" && ev.args && Array.isArray(ev.args.subquestions)) {
+          field = "subquestions";
           ta = el("textarea");
           ta.spellcheck = false;
           ta.value = ev.args.subquestions.join("\n");
           $(".detail", card).appendChild(ta);
+        } else if (sending && ev.args) {
+          field = "body";
+          $(".what", card).textContent =
+            "Send this reply from your Gmail account — edit it here first if you like. " +
+            "The recipient, subject and thread come from the message being replied to.";
+          ta = el("textarea");
+          ta.rows = 8;
+          ta.value = ev.args.body || "";
+          $(".detail", card).appendChild(ta);
         }
         const actions = $(".actions", card);
-        const go = el("button", "btn success", "Approve & continue");
-        const no = el("button", "btn danger-ghost", "Skip this");
+        const go = el("button", "btn success", sending ? "Send it" : "Approve & continue");
+        const no = el("button", "btn danger-ghost", sending ? "Don't send" : "Skip this");
         go.onclick = () => {
-          const args = ta
-            ? { ...ev.args, subquestions: ta.value.split("\n").map((s) => s.trim()).filter(Boolean) }
-            : null;
+          let args = null;
+          if (field === "subquestions") {
+            args = { ...ev.args,
+                     subquestions: ta.value.split("\n").map((s) => s.trim()).filter(Boolean) };
+          } else if (field === "body") {
+            args = { ...ev.args, body: ta.value };
+          }
           resolveApproval(this, ev, true, card, args);
         };
         no.onclick = () => resolveApproval(this, ev, false, card, null);
@@ -750,6 +767,7 @@
     catch (e) { w.innerHTML = `<div class="banner err">${esc(e.message)}</div>`; return; }
     w.innerHTML = "";
     w.appendChild(modelCard(s));
+    w.appendChild(connectionsCard(s));
     w.appendChild(browserCard(s));
     w.appendChild(searchCard(s));
   }
@@ -771,8 +789,11 @@
     $$("[data-field]", root).forEach((inp) => {
       const key = inp.dataset.field;
       if (inp.type === "checkbox") data[key] = inp.checked;
-      else if (key.includes("key")) { if (inp.value.trim()) data[key] = inp.value.trim(); }
-      else data[key] = inp.value.trim();
+      // Credentials: blank means "leave whatever is stored alone", so re-saving
+      // a form never silently wipes a key. Clearing one is always explicit.
+      else if (key.includes("key") || key.includes("token")) {
+        if (inp.value.trim()) data[key] = inp.value.trim();
+      } else data[key] = inp.value.trim();
     });
     return data;
   }
@@ -870,6 +891,72 @@
     return card;
   }
 
+  function connectionsCard(s) {
+    const c = s.connections || { notion: {}, google: {} };
+    const card = el("div", "card");
+    card.innerHTML = `<h3>Connections</h3>
+      <div class="desc">Accounts Theta reaches through their own APIs instead of by
+        driving the website. Faster, and it works headless — the browser can't log in,
+        because Theta never types a password.</div>`;
+
+    /* --- Notion ---------------------------------------------------------- */
+    card.appendChild(el("div", "section-title", "Notion"));
+    const n = c.notion || {};
+    if (n.connected) {
+      card.appendChild(el("div", "banner ok",
+        `✓ Connected with <code>${esc(n.token_masked)}</code> (from ${esc(n.token_source)}).
+         Theta can only see pages you've shared with the integration.`));
+    }
+    const nf = el("div", "field");
+    nf.innerHTML = `<label>Integration token</label>`;
+    const ni = el("input", "input");
+    ni.type = "password";
+    ni.dataset.field = "notion_token";
+    ni.placeholder = n.connected ? n.token_masked : "ntn_…";
+    nf.appendChild(ni);
+    nf.appendChild(el("div", "help",
+      'Create an internal integration at <a href="https://www.notion.so/my-integrations" ' +
+      'target="_blank" rel="noopener">notion.so/my-integrations</a>, copy its secret, then ' +
+      'open each page or database you want Theta to reach and use <b>⋯ → Connections</b> to ' +
+      'add it. Encrypted at rest, never sent back to this page.'));
+    card.appendChild(nf);
+
+    /* --- Gmail ----------------------------------------------------------- */
+    card.appendChild(el("div", "section-title", "Gmail"));
+    const g = c.google || {};
+    if (!g.configured) {
+      card.appendChild(el("div", "banner info",
+        "Gmail needs a Google OAuth client, which belongs to this deployment rather than " +
+        "to you. Set <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code> " +
+        "and restart — see <code>.env.example</code>."));
+    } else if (g.connected) {
+      card.appendChild(el("div", "banner ok",
+        `✓ Connected as <b>${esc(g.email || g.name || "your account")}</b>. Theta can read
+         and draft, and can only send after you approve each message.`));
+      const off = el("button", "btn danger-ghost small", "Disconnect Gmail");
+      off.onclick = async () => {
+        off.disabled = true;
+        try {
+          await postJSON("/api/auth/google/disconnect", {});
+          toast("Gmail disconnected");
+          renderSettings();
+        } catch (e) { toast(e.message, "err"); off.disabled = false; }
+      };
+      card.appendChild(off);
+    } else {
+      card.appendChild(el("div", "banner info",
+        "You'll sign in on Google's own page. Theta asks only to read mail, save drafts " +
+        "and send — never to delete or modify anything — and never sees your password."));
+      const on = el("button", "btn primary small", "Connect Gmail");
+      on.onclick = () => { location.href = "/api/auth/google/login"; };
+      card.appendChild(on);
+    }
+
+    wireSaveTest(card, { savePath: "/api/settings", testPath: "/api/settings/test-notion",
+                         testLabel: "Test Notion" });
+    return card;
+  }
+
   function browserCard(s) {
     const card = el("div", "card");
     card.innerHTML = `<h3>Browser</h3>
@@ -964,6 +1051,25 @@
     t.style.height = Math.min(t.scrollHeight, 170) + "px";
   }
 
+  const AUTH_ERRORS = {
+    state_mismatch: "That sign-in didn't match the request Theta started. Try again.",
+    exchange_failed: "Google wouldn't complete the sign-in. Check the OAuth client settings.",
+    access_denied: "Sign-in was cancelled, so Gmail is still disconnected.",
+  };
+
+  function handleReturnFromOAuth() {
+    /* The OAuth callback can only hand information back through the URL, so read
+       it once and scrub it — a shareable link should not carry a flow's outcome. */
+    const q = new URLSearchParams(location.search);
+    if (!q.has("view") && !q.has("connected") && !q.has("auth_error")) return null;
+    const view = q.get("view");
+    if (q.get("connected") === "google") toast("Gmail connected");
+    const error = q.get("auth_error");
+    if (error) toast(AUTH_ERRORS[error] || `Sign-in failed (${error})`, "err");
+    history.replaceState({}, "", location.pathname);
+    return view && TITLES[view] ? view : null;
+  }
+
   function init() {
     initTheme();
     $$(".nav-item").forEach((b) => (b.onclick = () => setView(b.dataset.view)));
@@ -974,7 +1080,11 @@
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendGoal(); }
     });
     $("#sendBtn").onclick = sendGoal;
-    refreshStatus().then(renderDoEmpty);
+    const returned = handleReturnFromOAuth();
+    refreshStatus().then(() => {
+      renderDoEmpty();
+      if (returned) setView(returned);
+    });
   }
 
   document.addEventListener("DOMContentLoaded", init);

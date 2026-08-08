@@ -28,6 +28,7 @@ from automation.runs import RunStep, runs
 from config import settings
 from server import preferences
 from server.session import Session
+from tools import catalog
 
 _log = logging.getLogger("theta.chat")
 
@@ -189,8 +190,11 @@ def _append_step(record, event: dict) -> None:
         record.steps.append(RunStep(
             index=int(event.get("index", len(record.steps) + 1)),
             tool=str(event.get("tool", "")),
+            # Reserved parameters are injected server-side, so they should never
+            # be here — but a model can put anything in `action_input`, and a run
+            # trace is not the place for a value shaped like a credential.
             args={k: v for k, v in (event.get("args") or {}).items()
-                  if k not in ("shot_path", "search_api_key")},
+                  if k not in catalog.RESERVED_PARAMS},
             label=str(event.get("label", "")),
             summary=str(event.get("summary", "")),
             ok=bool(event.get("ok")),
@@ -210,9 +214,10 @@ def _worth_saving(record) -> bool:
     """Only offer to save a Playbook when there is an automation worth keeping."""
     if record is None or record.status != "done":
         return False
-    from automation.playbooks import REPLAYABLE
+    from automation.playbooks import replayable_tools
 
-    useful = [s for s in record.steps if s.tool in REPLAYABLE and s.ok]
+    allowed = replayable_tools()
+    useful = [s for s in record.steps if s.tool in allowed and s.ok]
     return len(useful) >= 2
 
 
@@ -308,7 +313,8 @@ def _step_dict(s) -> dict:
         "status": s.status,
         "tag": s.tag,
         "source": s.source,
-        "args": {k: v for k, v in (s.args or {}).items() if k != "shot_path"},
+        "args": {k: v for k, v in (s.args or {}).items()
+                 if k not in catalog.RESERVED_PARAMS},
     }
 
 
