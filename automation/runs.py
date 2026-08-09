@@ -57,6 +57,10 @@ class Run:
     steps: list[RunStep] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)   # workspace files produced
     playbook_id: str = ""         # set when this run was a replay
+    # What started this run: a person typing ("task"), a person clicking replay
+    # ("playbook"), or the scheduler ("schedule"). Runs nobody watched are the
+    # ones most worth being able to find later, so Activity filters on it.
+    trigger: str = "task"
     model: str = ""
     approvals: int = 0
 
@@ -91,6 +95,8 @@ class Run:
             "seconds": self.seconds,
             "answer": self.answer[:300],
             "playbook_id": self.playbook_id,
+            "trigger": self.trigger,
+            "approvals": self.approvals,
             "outputs": self.outputs,
             "thumbnail": shots[-1] if shots else "",
         }
@@ -112,12 +118,14 @@ class RunStore:
             raise ValueError(f"Invalid run id: {run_id!r}")
         return self.dir / run_id
 
-    def create(self, goal: str, playbook_id: str = "", model: str = "") -> Run:
+    def create(self, goal: str, playbook_id: str = "", model: str = "",
+               trigger: str = "task") -> Run:
         run = Run(
             id=Run.new_id(),
             goal=goal,
             created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             playbook_id=playbook_id,
+            trigger=trigger,
             model=model,
         )
         self.run_dir(run.id).mkdir(parents=True, exist_ok=True)

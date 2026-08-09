@@ -125,6 +125,18 @@ class SessionStore:
         resolved, data = self.get_or_create(sid)
         return Session(resolved, data, self)
 
+    def existing(self, sid: str | None) -> Session | None:
+        """Look a session up without creating one.
+
+        The scheduler runs on behalf of a session that is not making a request,
+        and `get_or_create` would hand it a brand-new empty one — which looks
+        like "connected to nothing" instead of "that session is gone". The
+        difference matters: only the second is worth telling the user about.
+        """
+        with self._lock:
+            data = self._sessions.get(sid or "")
+        return Session(sid, data, self) if data is not None else None
+
 
 class SessionMiddleware(BaseHTTPMiddleware):
     """Reads/sets the encrypted session cookie and attaches `state.session`."""

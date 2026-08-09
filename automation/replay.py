@@ -59,6 +59,7 @@ def replay(
     llm: BaseLLM | None = None,
     on_progress: Progress | None = None,
     allow_heal: bool = True,
+    trigger: str = "playbook",
 ) -> Run:
     """Run a playbook end to end and return the Run that records it."""
     emit: Progress = on_progress or (lambda _e: None)
@@ -71,6 +72,7 @@ def replay(
         goal=f"Playbook: {playbook.name}",
         playbook_id=playbook.id,
         model=(llm.label if llm else ""),
+        trigger=trigger,
     )
     context.shot_path_factory = _shot_factory(run.id)
     emit({"type": "run_started", "record_id": run.id, "goal": run.goal})
@@ -103,9 +105,12 @@ def replay(
         )
         run.steps.append(rs)
         runs.save(run)
-        emit({"type": "tool_end", "index": i, "tool": rs.tool, "ok": rs.ok,
-              "label": rs.label, "status": rs.status, "summary": rs.summary,
-              "screenshot": rs.screenshot, "record_id": run.id, "url": rs.url})
+        event = {"type": "tool_end", "index": i, "tool": rs.tool, "ok": rs.ok,
+                 "label": rs.label, "status": rs.status, "summary": rs.summary,
+                 "screenshot": rs.screenshot, "record_id": run.id, "url": rs.url}
+        if "verified" in content:
+            event["verified"] = bool(content["verified"])
+        emit(event)
 
         if step.action == "read" and content.get("text"):
             read_text = str(content["text"])

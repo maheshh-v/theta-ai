@@ -13,7 +13,7 @@ license: mit
 
 **Describe a web task once. Theta does it in a real browser with your approval —
 then saves the working path as a one-click automation that re-runs with no model
-calls at all.**
+calls at all, on a schedule if you want it to.**
 
 Agents that browse are a demo. The interesting problem is what happens *after* one
 works: you should not have to pay a language model to re-derive the same fifteen
@@ -30,7 +30,9 @@ second.
            │
          ✓ invoices.csv saved                          38s · 11 steps · model used
            │
-           └── Save as Playbook ──►  ▶ Run          2.4s · 11 steps · no model
+           ├── Save as Playbook ──►  ▶ Run          2.4s · 11 steps · no model
+           │
+           └── Schedule it ────────►  ⏱ Weekdays at 08:30       unattended, free
 ```
 
 | | First run | As a Playbook |
@@ -95,6 +97,28 @@ redesigned, **that one step** escalates to the model, which re-identifies the
 control from its description — and the repaired selector is written back, so the
 next run is deterministic again.
 
+### 6. A schedule cannot improvise
+
+Once a Playbook exists you can put it on a timetable — hourly, daily, weekdays or
+weekly — and Theta runs it with nobody watching. Two properties make that
+defensible rather than reckless, and neither is a promise in a config file:
+
+- **It makes no model calls,** so a daily automation costs nothing to keep. There
+  is no model in the loop, so there is no room for one to improvise into something
+  you did not sanction.
+- **It cannot send an email.** Not by policy — by construction.
+  `playbooks.replayable_tools()` subtracts `catalog.ALWAYS_CONFIRM`, so an
+  approval-gated action never gets recorded into a Playbook in the first place,
+  and a Schedule can only run Playbooks.
+
+A background job also needs honest failure states, because "it broke" is useless
+at 8am. A run that collided with a live task is **skipped** and retried minutes
+later; one whose Playbook was deleted or whose Gmail was disconnected is
+**blocked** and pauses itself rather than failing on a timer forever; only a run
+that actually executed and did not work is **failed**, and that one keeps its
+timetable. Nothing catches up: two days offline is one run when Theta returns, not
+forty-eight.
+
 ---
 
 ## Run it
@@ -130,16 +154,20 @@ which is how you handle logins.
 ## Architecture
 
 ```
-  Browser SPA   Do · Playbooks · History · Settings
+  Browser SPA   Ask · Playbooks · Schedules · Activity · Connections · Settings
       │  POST + NDJSON stream         ▲ approve / reject a consequential action
       ▼                               │
   FastAPI  ── encrypted per-session store (cookie → server-side keys)
    ├─ /api/do, /api/do/resume        → the agent loop (resumable)
+   ├─ /api/capabilities              → what Theta can do + what is connected
    ├─ /api/playbooks[/{id}/run]      → record + replay
+   ├─ /api/schedules[/{id}/run]      → unattended replay on a timetable
    ├─ /api/runs[/{id}/shot/…]        → the audit trail
    ├─ /api/settings[/test]           → model + search config
    └─ /api/connections, /api/auth/…  → Notion token, Gmail OAuth
       │
+      ├── Scheduler (automation/scheduler.py) — fires due schedules, shares the
+      │   browser with live runs through one gate (automation/gate.py)
       ▼
   Agent loop (agent/orchestrator.py) — ReAct, one JSON action per step,
       │                                approval-gated, context-compressed
@@ -191,8 +219,18 @@ rather than bolted on beside it:
   is excluded from replay on purpose: replay skips approval gates, and one
   approved send must not become standing permission to send.
 
-Notion needs an integration token; Gmail needs an OAuth client. Both are set up in
-**Settings → Connections** — see `.env.example`.
+Notion needs an integration token; Gmail needs an OAuth client. Both are set up on
+the **Connections** page — see `.env.example`.
+
+### The UI describes itself from the backend
+
+`/api/capabilities` returns what Theta can do, what state each capability is in
+(`ready` / `connect` / `unavailable`), what connecting it would unlock in plain
+language, and example prompts to start from. The home screen, the capability
+sheets and the Connections page all render from that one payload, so the product
+cannot advertise a capability the backend does not actually have — and "Gmail:
+connected" is never left standing on its own, without saying what just became
+possible. `server/capabilities.py` is the single source of truth.
 
 ### Research is still here, as one tool
 
@@ -225,7 +263,7 @@ It is a supporting capability now, not the product.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest              # 247 tests, fully offline — no browser, no network
+pytest              # 302 tests, fully offline — no browser, no network
 python selftest.py  # boots the real MCP stack and drives a real website
 ```
 
@@ -256,7 +294,16 @@ set `GEMINI_API_KEY`, `THETA_SECRET_KEY` and `THETA_COOKIE_SECURE=1` in secrets.
 - **Sites that fight automation will win.** Aggressive bot detection, Cloudflare
   interstitials and CAPTCHAs are not worked around.
 - **One browser, one user.** The browser lives in a single MCP subprocess, so a
-  deployed instance is single-tenant. Run it privately.
+  deployed instance is single-tenant. Run it privately. Live runs and scheduled
+  runs are kept off each other's page by one gate: a person waiting at the screen
+  wins, and a schedule that finds the browser busy gives up its slot and retries.
+- **Schedules follow the clock, not a timezone database.** A time is stored as
+  local wall-clock plus the browser's UTC offset, captured when you save it. That
+  keeps "8am" meaning 8am with no extra dependency, at the cost of drifting an
+  hour across a DST change until the schedule is edited.
+- **A schedule outlives its session only as long as the session does.** It runs
+  with the connected accounts of whoever created it; if that session is cleared,
+  the schedule pauses itself and says so rather than silently doing nothing.
 - **Small local models struggle.** Operating a browser demands strict JSON every
   turn. Gemini Flash or an 8B+ Ollama model is the realistic floor.
 - **DuckDuckGo throttles.** Keyless search is best-effort; add a Tavily key for

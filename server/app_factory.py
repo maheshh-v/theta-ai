@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from automation.scheduler import Scheduler
 from config import settings
 from server import security
 from server.api import router as api_router
@@ -31,8 +32,8 @@ _log = logging.getLogger("theta")
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    for directory in (settings.briefs_dir, settings.runs_dir,
-                      settings.playbooks_dir, settings.workspace_dir):
+    for directory in (settings.briefs_dir, settings.runs_dir, settings.playbooks_dir,
+                      settings.schedules_dir, settings.workspace_dir):
         directory.mkdir(parents=True, exist_ok=True)
     # Start the MCP tool transport off the event loop (start() blocks briefly).
     mgr = MCPManager()
@@ -44,9 +45,15 @@ async def _lifespan(app: FastAPI):
             "No language model configured — set GEMINI_API_KEY in .env or add a key "
             "in Settings. Theta cannot research without one."
         )
+
+    # Schedules replay saved Playbooks unattended; the scheduler owns the timer.
+    scheduler = Scheduler(mgr, app.state.store)
+    app.state.scheduler = scheduler
+    scheduler.start()
     try:
         yield
     finally:
+        scheduler.stop()
         mgr.stop()
 
 

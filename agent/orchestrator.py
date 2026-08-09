@@ -64,6 +64,9 @@ class PendingApproval:
     thought: str
     label: str
     description: str
+    # Structured context for the approval card: which service, what exactly,
+    # whether it can be undone. See `catalog.approval_detail`.
+    detail: dict = field(default_factory=dict)
 
 
 _LLM_UNAVAILABLE = (
@@ -135,6 +138,8 @@ class AgentRun:
         self._by_name = {t.name: t for t in tools}
         # Which page elements will pause for approval, from the latest observation.
         self._gates: dict = {}
+        # The page the agent is on, so an approval card can say *where*.
+        self._last_url: str = ""
         self._gen = self._iter()
 
         # Let tools stream their own progress into this run's event channel.
@@ -215,6 +220,7 @@ class AgentRun:
                     index=step_no, tool=name, args=args, thought=thought,
                     label=catalog.label_for(name),
                     description=why or catalog.describe_action(name, args),
+                    detail=catalog.approval_detail(name, args, why, self._last_url),
                 )
                 # The terminal 'awaiting_approval' event (carrying a run_id) is
                 # emitted by the streaming layer, not here.
@@ -239,6 +245,8 @@ class AgentRun:
             # proposed click is judged against the page as it is *now*.
             if isinstance(observation, dict) and "gates" in observation:
                 self._gates = observation.get("gates") or {}
+            if isinstance(observation, dict) and observation.get("url"):
+                self._last_url = str(observation["url"])
             status = "done" if tool_result.ok else "error"
             summary = catalog.summarize(name, observation)
             self._record(step_no, thought, name, args, observation,
@@ -256,6 +264,11 @@ class AgentRun:
                     event["target"] = observation["target"]
                 if observation.get("warnings"):
                     event["warnings"] = observation["warnings"]
+                # Notion/Gmail writes re-read what they wrote. That confirmation
+                # is the point, so the UI gets it as a flag rather than having to
+                # parse it back out of the summary text.
+                if "verified" in observation:
+                    event["verified"] = bool(observation["verified"])
                 if observation.get("path"):          # file_write
                     event["output"] = observation["path"]
             self._emit(event)

@@ -24,6 +24,7 @@ from starlette.responses import StreamingResponse
 
 from agent.llm import LLMError
 from agent.orchestrator import Agent, AgentResult, PendingApproval
+from automation.gate import run_gate
 from automation.runs import RunStep, runs
 from config import settings
 from server import preferences
@@ -34,6 +35,11 @@ _log = logging.getLogger("theta.chat")
 
 _HISTORY_KEY = "history"
 _RUN_TTL = 60 * 60  # a parked run expires after an hour
+
+# How long a live run waits for the shared browser when a scheduled run has it.
+# It proceeds anyway afterwards: making a person watch a spinner indefinitely
+# because of a background job is worse than the collision this avoids.
+_GATE_WAIT = 45.0
 
 
 class RunRegistry:
@@ -126,8 +132,13 @@ def stream_run(app, session: Session, run, run_id: str,
         run.context.on_progress = emit
 
     def worker() -> None:
+        if run_gate.busy:
+            emit({"type": "notice", "kind": "queued",
+                  "message": "A scheduled automation is using the browser right now — "
+                             "starting yours as soon as it finishes."})
         try:
-            outcome = run.advance(approved, args)
+            with run_gate.hold(f"run:{run_id}", timeout=_GATE_WAIT, force=True):
+                outcome = run.advance(approved, args)
         except Exception as ex:  # pragma: no cover - defensive
             _log.exception("Agent run failed")
             outcome = AgentResult(answer=f"⚠️ Something went wrong: {ex}")
@@ -156,6 +167,7 @@ def stream_run(app, session: Session, run, run_id: str,
                         "label": outcome.label,
                         "description": outcome.description,
                         "args": outcome.args,
+                        "detail": outcome.detail,
                     })
                 else:
                     app.state.runs.remove(run_id)
@@ -249,8 +261,13 @@ def stream_replay(app, session: Session, playbook, values: dict) -> StreamingRes
     context = preferences.tool_context(session, llm)
 
     def worker() -> None:
+        if run_gate.busy:
+            emit({"type": "notice", "kind": "queued",
+                  "message": "A scheduled automation is using the browser right now — "
+                             "starting this replay as soon as it finishes."})
         try:
-            record = replay(playbook, values, app.state.mcp, context, llm, emit)
+            with run_gate.hold(f"replay:{playbook.id}", timeout=_GATE_WAIT, force=True):
+                record = replay(playbook, values, app.state.mcp, context, llm, emit)
             payload = {
                 "type": "final", "answer": record.answer, "record_id": record.id,
                 "outputs": record.outputs, "error": None if record.status == "done" else record.status,

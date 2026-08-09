@@ -18,6 +18,10 @@ data/runs/
 data/playbooks/
 data/workspace/
 data/briefs/
+# Schedules additionally carry `owner_sid` — the session id whose connected
+# accounts an unattended run uses. That is a credential-adjacent value and must
+# never reach the repository.
+data/schedules/
 
 # Local scratch / OS
 *.tmp

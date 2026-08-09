@@ -32,7 +32,7 @@ def isolate(tmp_path, monkeypatch):
     for name in ("notion_token", "google_client_id", "google_client_secret",
                  "google_redirect_uri"):
         monkeypatch.setattr(settings, name, "", raising=False)
-    for name in ("briefs", "runs", "playbooks", "workspace"):
+    for name in ("briefs", "runs", "playbooks", "schedules", "workspace"):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
 
     import server.security as sec

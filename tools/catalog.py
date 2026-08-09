@@ -167,6 +167,75 @@ def describe_action(name: str, args: dict) -> str:
     return f"Run {label_for(name)}."
 
 
+# What an approval card needs in order to be a decision rather than a dialog.
+# A good approval request names the exact action, the exact target, why it
+# stopped, and whether it can be taken back — "Approve the agent to fix the API
+# issue" is not a request anyone can reasonably answer.
+def approval_detail(name: str, args: dict, why: str = "", url: str = "") -> dict:
+    a = args or {}
+    if name == "gmail_send_reply":
+        return {
+            "service": "gmail",
+            "service_label": "Gmail",
+            "title": "Send this reply",
+            "target": "the sender of the message being replied to",
+            "why": "Sending puts words in your name in front of another person.",
+            "reversible": False,
+            "consequence": "The message leaves your mailbox immediately and cannot be recalled.",
+            "on_skip": "Nothing is sent. Theta carries on with the rest of the task.",
+            "confirm_label": "Send it",
+            "decline_label": "Don't send",
+            "edit_field": "body",
+        }
+    if name == "research":
+        plan = [str(q).strip() for q in (a.get("subquestions") or []) if str(q).strip()]
+        return {
+            "service": "web",
+            "service_label": "Web research",
+            "title": "Start deep research",
+            "target": str(a.get("question", ""))[:160],
+            "why": "This reads many pages and takes a while, so it is worth steering first.",
+            "reversible": True,
+            "consequence": f"Theta will work through {len(plan) or 'several'} sub-questions "
+                           "and write a brief.",
+            "on_skip": "No research runs. Theta answers from what it already has.",
+            "confirm_label": "Start research",
+            "decline_label": "Skip this",
+            "edit_field": "subquestions",
+        }
+    if name in GATED_BY_ELEMENT:
+        return {
+            "service": "browser",
+            "service_label": "This page",
+            "title": _browser_title(name, a),
+            "target": url or "the page Theta is on",
+            "why": why or "This control looks like it changes something for real.",
+            "reversible": False,
+            "consequence": "Theta will click it and the site will act on it.",
+            "on_skip": "Theta leaves the control alone and looks for another way.",
+            "confirm_label": "Approve & continue",
+            "decline_label": "Skip this",
+            "edit_field": "",
+        }
+    return {
+        "service": "", "service_label": "", "title": label_for(name),
+        "target": url, "why": why, "reversible": True, "consequence": "",
+        "on_skip": "Theta carries on without doing this.",
+        "confirm_label": "Approve & continue", "decline_label": "Skip this",
+        "edit_field": "",
+    }
+
+
+def _browser_title(name: str, a: dict) -> str:
+    if name == "browser_type" and a.get("submit"):
+        return f'Type “{_trim(a.get("text", ""), 40)}” and submit the form'
+    if name == "browser_type":
+        return f'Type “{_trim(a.get("text", ""), 40)}”'
+    if name == "browser_select":
+        return f'Choose “{_trim(a.get("option", ""), 40)}”'
+    return "Click this control"
+
+
 def summarize(name: str, result) -> str:
     """Short status line for the execution trace."""
     if isinstance(result, dict):

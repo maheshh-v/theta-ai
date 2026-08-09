@@ -24,11 +24,12 @@ from fastapi.responses import (
 from agent.llm import LLMError
 from automation.playbooks import from_run, playbooks
 from automation.runs import runs
+from automation.schedules import apply_edit, build as build_schedule, schedules
 from config import settings
 from integrations.google import oauth
 from research.briefs import store as briefs
 from research.render import to_markdown
-from server import accounts, chat, preferences
+from server import accounts, capabilities, chat, preferences
 from server.session import current_session
 from tools import catalog
 
@@ -50,6 +51,11 @@ def status(request: Request) -> dict:
     session = current_session(request)
     mgr = request.app.state.mcp
     config = preferences.public_config(session)
+    all_schedules = schedules.list()
+    connected = [
+        c["key"] for c in capabilities.connections(session)
+        if c["state"] == capabilities.READY
+    ]
     return {
         "ready": config["model_ready"],
         "model": config["active_label"],
@@ -60,7 +66,25 @@ def status(request: Request) -> dict:
         "tool_count": len([t for t in mgr.list_tools() if t.name not in catalog.HIDDEN_TOOLS]),
         "playbooks": len(playbooks.list()),
         "runs": len(runs.list(limit=200)),
+        "schedules": len([s for s in all_schedules if s.enabled]),
+        # Schedules that paused themselves and need a human — the one thing in
+        # this app that can go wrong while nobody is looking.
+        "schedules_need_attention": len([
+            s for s in all_schedules if not s.enabled and s.last_status == "blocked"
+        ]),
+        "connected": connected,
         "headless": config["browser_headless"],
+    }
+
+
+@router.get("/capabilities")
+def capabilities_index(request: Request) -> dict:
+    """What Theta can do, what is connected, and what to try first."""
+    session = current_session(request)
+    return {
+        "model": capabilities.model_state(session),
+        "capabilities": capabilities.all_capabilities(session),
+        "starters": capabilities.starters(session),
     }
 
 
@@ -200,7 +224,86 @@ async def playbook_update(pid: str, request: Request):
 def playbook_delete(pid: str):
     if not playbooks.delete(pid):
         return JSONResponse({"error": "not_found"}, status_code=404)
+    # A schedule whose Playbook is gone can never run again; drop it with the
+    # Playbook rather than leaving it to fail on its next tick.
+    removed = schedules.delete_for_playbook(pid)
+    return {"status": "deleted", "schedules_removed": removed}
+
+
+# --------------------------------------------------------------------------- #
+# Schedules — Playbooks that run themselves                                   #
+# --------------------------------------------------------------------------- #
+@router.get("/schedules")
+def schedules_index() -> dict:
+    items = schedules.list()
+    names = {p.id: p.name for p in playbooks.list()}
+    payload = []
+    for schedule in items:
+        data = schedule.summary_dict()
+        data["playbook_name"] = names.get(schedule.playbook_id, "")
+        data["playbook_missing"] = schedule.playbook_id not in names
+        payload.append(data)
+    return {"count": len(payload), "schedules": payload}
+
+
+@router.post("/schedules")
+async def schedule_create(request: Request):
+    data = await _json_body(request)
+    playbook = playbooks.get(str(data.get("playbook_id", "")))
+    if playbook is None:
+        return JSONResponse({"error": "playbook_not_found"}, status_code=404)
+
+    session = current_session(request)
+    # The schedule runs later, with nobody watching, using this session's
+    # connected accounts — so it records whose they are.
+    schedule = build_schedule(playbook, data, owner_sid=session.sid)
+    schedules.save(schedule)
+    return schedule.summary_dict()
+
+
+@router.patch("/schedules/{sid}")
+async def schedule_update(sid: str, request: Request):
+    schedule = schedules.get(sid)
+    if schedule is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    data = await _json_body(request)
+    playbook = playbooks.get(schedule.playbook_id)
+
+    # Resuming a schedule is also how a user clears a "blocked" state, so it
+    # re-homes to the session doing the resuming — whose accounts are connected.
+    if data.get("enabled") and not schedule.enabled:
+        schedule.owner_sid = current_session(request).sid
+        schedule.last_error = ""
+
+    apply_edit(schedule, playbook, data)
+    schedules.save(schedule)
+    return schedule.summary_dict()
+
+
+@router.delete("/schedules/{sid}")
+def schedule_delete(sid: str):
+    if not schedules.delete(sid):
+        return JSONResponse({"error": "not_found"}, status_code=404)
     return {"status": "deleted"}
+
+
+@router.post("/schedules/{sid}/run")
+async def schedule_run_now(sid: str, request: Request):
+    """Run a schedule immediately, streamed like any other replay, so a user can
+    see what the unattended version will actually do before trusting it.
+
+    Async because `stream_replay` needs the running event loop to marshal events
+    back from its worker thread; a sync handler is dispatched to a threadpool
+    where there is none.
+    """
+    schedule = schedules.get(sid)
+    if schedule is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    playbook = playbooks.get(schedule.playbook_id)
+    if playbook is None:
+        return JSONResponse({"error": "playbook_not_found"}, status_code=404)
+    return chat.stream_replay(request.app, current_session(request),
+                              playbook, dict(schedule.values))
 
 
 # --------------------------------------------------------------------------- #

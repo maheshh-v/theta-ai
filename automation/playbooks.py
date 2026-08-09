@@ -64,6 +64,22 @@ TEMPLATED_ARGS = ("query", "title", "markdown", "content", "body", "find", "repl
 API_PREFIX = "api:"
 
 
+def required_services(pb: "Playbook") -> set[str]:
+    """Which connected accounts a playbook needs in order to replay.
+
+    A schedule uses this to fail *before* it runs with a message worth reading
+    ("Reconnect Gmail") rather than after, with a stack of tool errors.
+    """
+    out: set[str] = set()
+    for step in pb.steps:
+        if not step.action.startswith(API_PREFIX):
+            continue
+        server = step.action[len(API_PREFIX):].split("_", 1)[0]
+        if server in catalog.CREDENTIAL_PARAMS:
+            out.add(server)
+    return out
+
+
 def replayable_tools() -> set[str]:
     """Every tool a completed run can contribute to a playbook.
 

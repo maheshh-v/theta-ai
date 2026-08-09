@@ -130,6 +130,15 @@ class Settings:
     max_agent_steps: int = _int("MAX_AGENT_STEPS", 28, 1, 80)
     history_turns: int = _int("HISTORY_TURNS", 6, 0, 40)
 
+    # --- Schedules --------------------------------------------------------- #
+    # How often the scheduler looks for due work, and how long a scheduled run
+    # waits for the browser when a live task already has it.
+    scheduler_enabled: bool = _env("THETA_SCHEDULER", "1").lower() not in {
+        "0", "false", "no",
+    }
+    scheduler_tick: int = _int("THETA_SCHEDULER_TICK", 30, 5, 600)
+    scheduler_defer: int = _int("THETA_SCHEDULER_DEFER", 5, 1, 120)
+
     # --- Server ------------------------------------------------------------ #
     server_host: str = _env("THETA_HOST", "127.0.0.1")
     # PORT is the convention most hosts (Render, Railway, Fly, Heroku) inject.
@@ -166,6 +175,11 @@ class Settings:
     @property
     def playbooks_dir(self) -> Path:
         return self.data_dir / "playbooks"
+
+    @property
+    def schedules_dir(self) -> Path:
+        """Recurring, unattended Playbook runs — see automation/schedules.py."""
+        return self.data_dir / "schedules"
 
     @property
     def workspace_dir(self) -> Path:
